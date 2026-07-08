@@ -1,0 +1,41 @@
+name: CI
+
+# Lance le smoke test (RDD == DataFrame) à chaque push et pull request sur main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    name: Smoke test (RDD vs DataFrame)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      # Spark 3.5 exige un JDK 8/11/17. On installe le 17.
+      # setup-java positionne JAVA_HOME ; sur Linux, get_spark() ne trouve pas
+      # /usr/libexec/java_home (spécifique macOS) et respecte donc ce JAVA_HOME.
+      - name: Installer le JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # pyspark 3.5.* ne supporte pas Python 3.13/3.14 -> on fixe 3.12.
+      - name: Installer Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lancer le smoke test
+        run: python tests/test_smoke.py
