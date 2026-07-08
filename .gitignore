@@ -1,0 +1,30 @@
+# --- Environnement Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.python-version
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# --- Données téléchargées (regénérables via data/*.py) ---
+data/sms_spam.csv
+data/*.zip
+
+# --- Sorties du benchmark (regénérables via src/benchmark.py) ---
+results/*.csv
+results/*.png
+
+# --- Spark ---
+spark-warehouse/
+metastore_db/
+derby.log
+
+# --- Outils / IDE / OS ---
+.claude/
+.idea/
+.vscode/
+.DS_Store
