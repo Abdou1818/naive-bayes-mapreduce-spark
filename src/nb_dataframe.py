@@ -49,9 +49,14 @@ def _to_dataframe(spark, data: List[Tuple[int, List[int]]], num_partitions: int)
 
 
 def train_dataframe(spark, train_data: List[Tuple[int, List[int]]], vocab_size: int,
-                    idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8
-                    ) -> C.NaiveBayesModel:
-    """Entraîne le modèle Naive Bayes avec l'API DataFrames (groupBy/agg)."""
+                    idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8,
+                    model_builder=C.build_model) -> C.NaiveBayesModel:
+    """Entraîne le modèle Naive Bayes avec l'API DataFrames (groupBy/agg).
+
+    ``model_builder`` permet de choisir la loi (multinomial par défaut, ou
+    ``C.build_model_categorical`` pour la variante du papier) : le comptage
+    explode/groupBy est identique, seule la construction du modèle change.
+    """
     df = _to_dataframe(spark, train_data, num_partitions)
     df.cache()  # réutilisé plusieurs fois ci-dessous -> on le met en cache
 
@@ -89,7 +94,7 @@ def train_dataframe(spark, train_data: List[Tuple[int, List[int]]], vocab_size: 
     df.unpersist()
 
     # --- (e) Construction du modèle (identique à la version RDD) ------------
-    return C.build_model(
+    return model_builder(
         n_docs=n_docs,
         vocab_size=vocab_size,
         idx_to_label=idx_to_label,

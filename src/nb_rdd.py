@@ -29,8 +29,8 @@ import nb_common as C
 
 
 def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
-              idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8
-              ) -> C.NaiveBayesModel:
+              idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8,
+              model_builder=C.build_model) -> C.NaiveBayesModel:
     """Entraîne le modèle Naive Bayes en RDD (map/reduceByKey).
 
     Paramètres
@@ -41,6 +41,11 @@ def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
     idx_to_label   : correspondance indice_classe -> étiquette d'origine.
     alpha          : lissage de Laplace.
     num_partitions : nombre de partitions du RDD (parallélisme des données).
+    model_builder  : fonction (comptes -> modèle). Par défaut le multinomial
+                     ``C.build_model`` ; passer ``C.build_model_categorical``
+                     (via functools.partial) pour la variante catégorielle du
+                     papier. Le comptage map/reduce ci-dessous est IDENTIQUE dans
+                     les deux cas — seule la construction du modèle diffère.
     """
     # On distribue les documents sur le cluster (ici local[k]) en `num_partitions`.
     docs = sc.parallelize(train_data, numSlices=num_partitions)
@@ -79,7 +84,7 @@ def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
 
     # --- (e) Construction du modèle (comptes entiers -> log-probas) ---------
     # Calcul factorisé dans nb_common pour être identique à la version DataFrame.
-    return C.build_model(
+    return model_builder(
         n_docs=n_docs,
         vocab_size=vocab_size,
         idx_to_label=idx_to_label,

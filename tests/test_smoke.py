@@ -88,14 +88,37 @@ def run() -> None:
         print(f"Prédictions RDD    : {pred_rdd}")
         print(f"Prédictions DF     : {pred_df}")
 
-        # --- Assertions du smoke test ---------------------------------------
+        # --- Assertions du smoke test (multinomial) -------------------------
         assert acc_rdd == acc_df, (
             f"Accuracies différentes : RDD={acc_rdd} vs DF={acc_df}"
         )
         assert pred_rdd == pred_df, (
             "Les prédictions ligne à ligne diffèrent entre RDD et DataFrame."
         )
-        print("\nOK : RDD et DataFrame donnent des prédictions et une accuracy identiques.")
+        print("\nOK (multinomial) : RDD et DataFrame donnent des prédictions identiques.")
+
+        # --- Variante CATÉGORIELLE (jeu tabulaire minuscule) ----------------
+        import functools
+
+        # 6 instances, 2 attributs catégoriels, 2 classes.
+        rows = [["a", "x"], ["a", "y"], ["b", "x"],
+                ["b", "y"], ["a", "x"], ["b", "y"]]
+        labs = ["p", "p", "n", "n", "p", "n"]
+        tab = C.prepare_tabular(rows[:4], labs[:4], rows[4:], labs[4:])
+        cat_builder = functools.partial(
+            C.build_model_categorical,
+            feature_attr=tab.feature_attr, attr_domain_sizes=tab.attr_domain_sizes,
+        )
+        cm_rdd = nb_rdd.train_rdd(sc, tab.train, tab.vocab_size, tab.idx_to_label,
+                                  model_builder=cat_builder)
+        cm_df = nb_dataframe.train_dataframe(spark, tab.train, tab.vocab_size,
+                                             tab.idx_to_label, model_builder=cat_builder)
+        cpred_rdd = nb_rdd.predict_rdd(sc, cm_rdd, tab.test)
+        cpred_df = nb_dataframe.predict_dataframe(spark, cm_df, tab.test)
+        assert cpred_rdd == cpred_df, (
+            "NB catégoriel : prédictions RDD et DataFrame différentes."
+        )
+        print("OK (catégoriel)  : RDD et DataFrame donnent des prédictions identiques.")
     finally:
         spark.stop()
 

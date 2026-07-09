@@ -13,6 +13,7 @@ notebooks/.ipynb_checkpoints/
 # --- Données téléchargées (regénérables via data/*.py) ---
 data/sms_spam.csv
 data/*.zip
+data/uci/
 
 # --- Sorties du benchmark (regénérables via src/benchmark.py) ---
 results/*.csv
