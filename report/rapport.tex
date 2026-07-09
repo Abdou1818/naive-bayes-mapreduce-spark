@@ -7,7 +7,7 @@
 \usepackage{lmodern}
 
 % --- Mise en page ---
-\usepackage[margin=2.5cm]{geometry}
+\usepackage[margin=2.4cm]{geometry}
 \usepackage{microtype}
 \usepackage{parskip}
 
@@ -17,70 +17,115 @@
 \usepackage{array}
 \usepackage{graphicx}
 \usepackage{float}
-\usepackage{listings}
 \usepackage{xcolor}
+\usepackage{listings}
 
 % --- Liens ---
 \usepackage[hidelinks]{hyperref}
-\hypersetup{
-  colorlinks=true,
-  linkcolor=black,
-  urlcolor=blue!60!black,
-  citecolor=black
-}
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue!60!black, citecolor=black}
 
-% --- Style des blocs de code ---
+% --- Styles de code -----------------------------------------------------------
 \definecolor{codebg}{gray}{0.96}
+\definecolor{outbg}{rgb}{0.94,0.96,1.0}
+\definecolor{kw}{rgb}{0.0,0.2,0.7}
+\definecolor{cmt}{rgb}{0.30,0.55,0.30}
+\definecolor{str}{rgb}{0.6,0.1,0.1}
+
+% Table de correspondance Unicode -> LaTeX pour inclure le code source verbatim.
 \lstset{
-  basicstyle=\ttfamily\small,
-  backgroundcolor=\color{codebg},
-  frame=single,
-  framerule=0pt,
-  breaklines=true,
-  columns=fullflexible,
-  keepspaces=true,
-  showstringspaces=false,
-  aboveskip=1ex,
-  belowskip=1ex,
-  literate={é}{{\'e}}1 {è}{{\`e}}1 {à}{{\`a}}1 {ê}{{\^e}}1 {É}{{\'E}}1 {ô}{{\^o}}1 {î}{{\^i}}1 {ç}{{\c c}}1 {û}{{\^u}}1 {α}{{$\alpha$}}1 {×}{{$\times$}}1
+  inputencoding=utf8,
+  extendedchars=true,
+  literate=%
+    {é}{{\'e}}1 {è}{{\`e}}1 {à}{{\`a}}1 {ê}{{\^e}}1 {î}{{\^i}}1 {ô}{{\^o}}1
+    {â}{{\^a}}1 {û}{{\^u}}1 {ù}{{\`u}}1 {ç}{{\c c}}1 {ï}{{\"i}}1 {ë}{{\"e}}1
+    {ü}{{\"u}}1 {ö}{{\"o}}1 {É}{{\'E}}1 {È}{{\`E}}1 {Ê}{{\^E}}1 {À}{{\`A}}1
+    {Ç}{{\c C}}1 {œ}{{\oe}}1 {Œ}{{\OE}}1 {«}{{\guillemotleft}}1
+    {»}{{\guillemotright}}1 {—}{{---}}1 {–}{{--}}1 {±}{{$\pm$}}1
+    {≈}{{$\approx$}}1 {×}{{$\times$}}1 {→}{{$\rightarrow$}}1 {✅}{{[OK]}}1
+    {❌}{{[X]}}1 {⚠}{{[!]}}1 {…}{{...}}1 {✓}{{v}}1
 }
 
-\newcommand{\code}[1]{\lstinline!#1!}
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0pt, framesep=4pt,
+  breaklines=true, breakatwhitespace=false,
+  columns=fullflexible, keepspaces=true, showstringspaces=false,
+  numbers=none, aboveskip=1ex, belowskip=1ex,
+}
+\lstdefinestyle{nboutput}{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{outbg},
+  frame=single, framerule=0pt, framesep=4pt,
+  breaklines=true, columns=fullflexible, keepspaces=true,
+}
+\lstset{style=py}   % style par défaut
+\newcommand{\code}[1]{\lstinline[style=py]!#1!}
 
-% --- Métadonnées ---
+% --- Métadonnées --------------------------------------------------------------
 \title{\textbf{ML on Big Data}\\[0.3em]
-\large Naive Bayes multinomial en MapReduce sur Spark}
-\author{Abdou1818 \\ \small Master --- Université Paris-Dauphine}
+\large Naive Bayes multinomial en MapReduce sur Spark\\
+\normalsize (K-NN \emph{or} Naive Bayes --- option Naive Bayes)}
+\author{Abdou1818 \\ \small Master --- Université Paris-Dauphine \\
+\small Cours « ML on Big Data » --- Prof. D. Colazzo}
 \date{Juillet 2026}
 
 \begin{document}
 \maketitle
 
-\begin{center}
-\small Dépôt : \url{https://github.com/Abdou1818/naive-bayes-mapreduce-spark}
+\begin{center}\small
+Dépôt : \url{https://github.com/Abdou1818/naive-bayes-mapreduce-spark}
 \end{center}
 
-\hrule
-\vspace{1em}
-
-% ======================================================================
-\section{Objectif}
-
-Implémenter le classifieur \textbf{Naive Bayes multinomial} selon le paradigme
-\textbf{MapReduce} sur Apache Spark, en \textbf{deux versions} :
-\begin{itemize}
-  \item une version \textbf{RDD} (API bas niveau, \code{map} / \code{reduceByKey}) ;
-  \item une version \textbf{DataFrames} (API relationnelle, \code{explode} + \code{groupBy} / \code{agg}).
-\end{itemize}
-Les deux versions doivent produire des \textbf{prédictions rigoureusement identiques}, et
-l'on mène une \textbf{étude de scalabilité} faisant varier (i) le volume de données et
-(ii) le parallélisme (\code{local[k]}).
-
-% ======================================================================
-\section{Données}
+% ==============================================================================
+\noindent\textbf{Organisation du rapport et correspondance avec le barème.}
+Ce document est structuré pour répondre \emph{explicitement}, section par section, aux
+cinq items notés de l'énoncé (total 20 points).
 
 \begin{table}[H]
 \centering
+\small
+\begin{tabular}{@{}p{8.4cm}cc@{}}
+\toprule
+\textbf{Item du barème} & \textbf{Points} & \textbf{Section} \\
+\midrule
+1. Description de la solution adoptée & 3 & \S\ref{sec:solution} \\
+2a. Algorithmes conçus + description globale & 3 & \S\ref{sec:algos} \\
+2b. Commentaires des fragments de code clés & 3 & \S\ref{sec:fragments} \\
+3. Analyse expérimentale (scalabilité) & 3 & \S\ref{sec:scalability} \\
+4. Points forts / points faibles des algorithmes & 3 & \S\ref{sec:forces} \\
+5. Annexe : tout le code + notebook (petites données, E/S commentées) & 4 & Annexes \ref{sec:annexe-code}--\ref{sec:annexe-nb} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\tableofcontents
+\bigskip
+\hrule
+
+% ==============================================================================
+\section{Description de la solution adoptée \hfill\normalsize\textmd{[Item 1 --- 3 pts]}}
+\label{sec:solution}
+
+\subsection{Problème}
+On implémente un classifieur \textbf{Naive Bayes multinomial} pour la classification de
+texte, selon le paradigme \textbf{MapReduce}, sur Apache Spark. L'objectif pédagogique est
+de comprendre l'algorithme MapReduce du classifieur~\cite{nbmapreduce} et de le coder en
+Spark en \textbf{deux versions} (contrainte de l'énoncé), \textbf{en Python uniquement} :
+\begin{itemize}
+  \item version \textbf{RDD} (API bas niveau : \code{map} / \code{reduceByKey}) ;
+  \item version \textbf{DataFrames} (API relationnelle : \code{explode} + \code{groupBy}/\code{agg}).
+\end{itemize}
+Exigence forte que nous garantissons : les deux versions produisent des \textbf{prédictions
+rigoureusement identiques} (\S\ref{sec:identite}).
+
+\subsection{Données}
+\begin{table}[H]
+\centering\small
 \begin{tabular}{@{}llll@{}}
 \toprule
 \textbf{Jeu} & \textbf{Rôle} & \textbf{Taille} & \textbf{Source} \\
@@ -90,253 +135,292 @@ SMS Spam Collection & démonstration / test (petit) & 5\,574 SMS (ham/spam) & UC
 \bottomrule
 \end{tabular}
 \end{table}
+Le petit jeu sert au notebook et au smoke test ; le grand jeu sert à l'étude de scalabilité.
+Pour 20 Newsgroups, en-têtes, pieds de page et citations sont retirés pour ne garder qu'un
+signal textuel.
 
-Pour 20 Newsgroups, les en-têtes, pieds de page et citations sont retirés
-(\code{remove=("headers","footers","quotes")}) afin de ne garder qu'un signal textuel et
-d'éviter un sur-apprentissage trivial.
-
-% ======================================================================
-\section{Rappel du modèle}
-
-On travaille en \textbf{sac de mots} (bag-of-words). Pour un document $d$, une classe $c$,
-un vocabulaire de taille $V$ et un lissage de Laplace $\alpha = 1$, le modèle multinomial
-pose :
-\begin{align}
-  \log P(c)      &= \log\!\left( \frac{N_c}{N} \right), \\
-  \log P(w \mid c) &= \log\!\left( \frac{\mathrm{count}_{w,c} + \alpha}{\mathrm{total}_c + \alpha V} \right),
-\end{align}
-où $N$ est le nombre de documents d'entraînement, $N_c$ les documents de la classe $c$,
-$\mathrm{count}_{w,c}$ les occurrences du mot $w$ dans la classe $c$, et
-$\mathrm{total}_c = \sum_w \mathrm{count}_{w,c}$.
-
-La \textbf{prédiction} maximise, en logarithme (pour éviter les sous-débordements) :
-\begin{equation}
-  \mathrm{score}(d, c) = \log P(c) + \sum_{w \in d} \mathrm{count}_w(d)\, \log P(w \mid c).
-\end{equation}
-
-Notre implémentation reproduit exactement \code{sklearn.naive_bayes.MultinomialNB}
-($\alpha=1$, \code{fit\_prior=True}), ce qui est \textbf{vérifié empiriquement} (§\ref{sec:valid}).
-
-% ======================================================================
-\section{Formulation MapReduce}
-
-L'entraînement se réduit à des \textbf{comptages} --- le cas idéal pour MapReduce. Le cœur
-est le calcul de $\mathrm{count}_{w,c}$ (occurrences de chaque mot par classe).
-
-\subsection{Version RDD (\texttt{src/nb\_rdd.py})}
-Chaque document est une paire \code{(indice_classe, [indices de mots])}.
-\begin{itemize}
-  \item \textbf{MAP} (\code{flatMap}) : pour chaque occurrence d'un mot $w$ dans un document
-        de classe $c$, émettre \code{((c, w), 1)}.
-  \item \textbf{REDUCE} (\code{reduceByKey(add)}) : additionner les $1 \to \mathrm{count}_{w,c}$.
-\end{itemize}
-On compte de même les documents par classe ($N_c$) et les tokens par classe
-($\mathrm{total}_c$).
-
-\subsection{Version DataFrames (\texttt{src/nb\_dataframe.py})}
-Le DataFrame a le schéma \code{(label:int, words:array<int>)}.
-\begin{itemize}
-  \item \textbf{MAP} : \code{explode(words)} $\to$ une ligne \code{(label, word)} par
-        occurrence (équivalent du \code{flatMap}).
-  \item \textbf{REDUCE} : \code{groupBy(label, word).count()} $\to \mathrm{count}_{w,c}$.
-\end{itemize}
-
-\subsection{Construction du modèle et broadcast}
-Les deux versions produisent \textbf{exactement les mêmes agrégats entiers}, puis appellent
-la \textbf{même} fonction \code{nb_common.build_model} (comptes $\to$ log-probabilités
-lissées) et la \textbf{même} fonction \code{nb_common.predict_indices}. Comme les comptes
-sont entiers (reproductibles au bit près) et que la prédiction est déterministe, \textbf{les
-deux versions donnent des prédictions identiques par construction}.
-
-Le modèle est stocké de façon \textbf{creuse mais équivalente au dense} : on ne mémorise
-$\log P(w\mid c)$ que pour les couples $(c, w)$ de compte non nul, plus une valeur par défaut
-$\log(\alpha / (\mathrm{total}_c + \alpha V))$ pour les mots de compte nul. Ce modèle est
-\textbf{broadcasté} (\code{sc.broadcast}) : Spark l'envoie une seule fois par worker (lecture
-seule), au lieu de le re-sérialiser à chaque tâche --- essentiel quand $V \times C$ est grand.
-La prédiction se fait via un \code{map} (RDD) ou une \textbf{UDF} (DataFrame) référençant le
-modèle broadcasté.
-
-% ======================================================================
-\section{Protocole expérimental}
-
-\begin{itemize}
-  \item \textbf{Machine} : macOS (Apple Silicon, arm64), \textbf{8 cœurs} (4 \emph{performance}
-        + 4 \emph{efficiency}).
-  \item \textbf{Pile} : Python 3.12, PySpark 3.5.8, JDK 17. Spark en mode \textbf{local}
-        (\code{local[k]}).
-  \item \textbf{Deux expériences} (\code{src/benchmark.py}) :
-  \begin{enumerate}
-    \item \textbf{Volume} : à \code{local[*]} (8 threads), réplication de 20 Newsgroups par un
-          facteur $\in \{\times 1, \times 2, \times 4, \times 8\}$.
-    \item \textbf{Parallélisme} : à volume fixe (facteur $\times 8$, $\sim$121\,k documents),
-          variation de \code{local[k]}, $k \in \{1, 2, 4, 8\}$.
-  \end{enumerate}
-  \item \textbf{Précautions méthodologiques} (corrigées après une première version) :
-  \begin{itemize}
-    \item \textbf{Anti-fuite de données} : la réplication est faite \textbf{après} le
-          découpage train/test, et \textbf{séparément} de chaque côté. Un document de test ne
-          peut donc jamais apparaître (même dupliqué) dans l'entraînement.
-    \item \textbf{Bruit de mesure} : option \code{--repeat 3} --- chaque point est mesuré 3
-          fois et agrégé en \textbf{moyenne $\pm$ écart-type} (colonnes \code{train_time_std},
-          \code{predict_time_std} ; barres d'erreur sur les graphes).
-  \end{itemize}
-\end{itemize}
-
-\begin{lstlisting}
-python src/benchmark.py --factors 1 2 4 8 --cores 1 2 4 8 --repeat 3
-\end{lstlisting}
-
-% ======================================================================
-\section{Validation de correction}
-\label{sec:valid}
-
-\begin{itemize}
-  \item \textbf{Smoke test} (\code{tests/test_smoke.py}, aussi en CI GitHub Actions) : sur un
-        mini-jeu, RDD et DataFrame donnent \textbf{accuracy et prédictions identiques}.
-  \item \textbf{Notebook} (\code{notebooks/demo.ipynb}) sur SMS Spam réel :
-        \textbf{accuracy $= 0.9848$}, avec \textbf{RDD $=$ DataFrame $=$
-        \texttt{sklearn.MultinomialNB}} (prédictions identiques).
-  \item Le benchmark \textbf{assert} à chaque point l'égalité des accuracy RDD/DataFrame.
-\end{itemize}
-
-% ======================================================================
-\section{Résultats}
-
-\emph{20 Newsgroups complet, \code{--repeat 3} ; temps en secondes, moyenne $\pm$ écart-type.}
-
-\subsection{Scalabilité en volume (\texttt{local[*]} = 8 threads)}
+\subsection{Architecture logicielle}
+La solution isole dans un module \textbf{commun} (\code{src/nb_common.py}) tout ce qui doit
+être identique entre les deux versions : tokenisation, vocabulaire, découpage,
+\emph{construction du modèle} (comptes $\to$ log-probabilités) et \emph{fonction de
+prédiction}. Les modules \code{src/nb_rdd.py} et \code{src/nb_dataframe.py} ne font que
+produire, chacun à sa manière (map/reduce), les mêmes \emph{comptes entiers}, puis délèguent
+au module commun. C'est ce qui rend l'égalité des prédictions vraie \emph{par construction}.
 
 \begin{table}[H]
-\centering
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Fichier} & \textbf{Rôle} \\
+\midrule
+\code{src/nb_common.py}    & tokenisation, vocabulaire, split, \code{build_model}, \code{predict_indices}, \code{get_spark} \\
+\code{src/nb_rdd.py}       & entraînement/prédiction en RDD (\code{flatMap}/\code{reduceByKey} + broadcast) \\
+\code{src/nb_dataframe.py} & idem en DataFrames (\code{explode} + \code{groupBy}/\code{agg} + UDF) \\
+\code{src/benchmark.py}    & étude de scalabilité $\to$ \code{results.csv} + graphes PNG \\
+\code{data/download\_*.py}  & récupération SMS Spam / 20 Newsgroups \\
+\code{tests/test\_smoke.py} & test d'égalité RDD == DataFrame \\
+\code{notebooks/demo.ipynb} & démo end-to-end sur petites données + comparaison sklearn \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ==============================================================================
+\section{Algorithmes conçus et description globale \hfill\normalsize\textmd{[Item 2a --- 3 pts]}}
+\label{sec:algos}
+
+\subsection{Le modèle Naive Bayes multinomial}
+Pour un document $d$, une classe $c$, un vocabulaire de taille $V$ et un lissage de Laplace
+$\alpha=1$, tous les calculs se font \textbf{en logarithme} (pour éviter les
+sous-débordements numériques) :
+\begin{align}
+  \log P(c)      &= \log\!\left( \frac{N_c}{N} \right), &
+  \log P(w \mid c) &= \log\!\left( \frac{\mathrm{count}_{w,c} + \alpha}{\mathrm{total}_c + \alpha V} \right),
+\end{align}
+avec $N$ le nombre de documents d'entraînement, $N_c$ ceux de la classe $c$,
+$\mathrm{count}_{w,c}$ les occurrences du mot $w$ en classe $c$, et
+$\mathrm{total}_c=\sum_w \mathrm{count}_{w,c}$. La prédiction maximise :
+\begin{equation}
+  \mathrm{score}(d,c) = \log P(c) + \sum_{w\in d}\mathrm{count}_w(d)\,\log P(w\mid c).
+\end{equation}
+Le modèle reproduit exactement \code{sklearn.naive\_bayes.MultinomialNB} ($\alpha=1$,
+\code{fit\_prior=True}), ce qui est vérifié empiriquement (\S\ref{sec:identite}).
+
+\subsection{Formulation MapReduce (entraînement)}
+L'entraînement se ramène à des \textbf{comptages} --- cas idéal pour MapReduce. Le cœur est
+$\mathrm{count}_{w,c}$ :
+\begin{itemize}
+  \item \textbf{MAP} : pour chaque occurrence d'un mot $w$ dans un document de classe $c$,
+        émettre la paire $\big((c,w),\,1\big)$.
+  \item \textbf{REDUCE} : sommer les $1$ par clé $(c,w)$ $\to \mathrm{count}_{w,c}$.
+\end{itemize}
+On compte de même $N_c$ (documents par classe) et $\mathrm{total}_c$ (tokens par classe).
+La version RDD exprime le MAP par \code{flatMap} et le REDUCE par \code{reduceByKey} ; la
+version DataFrames exprime le MAP par \code{explode} (une ligne par mot) et le REDUCE par
+\code{groupBy(label, word).count()}.
+
+\subsection{Construction du modèle et broadcast}
+Les deux versions passent les mêmes \emph{comptes entiers} à la fonction commune
+\code{build\_model}, qui calcule les log-probabilités lissées. Le modèle est stocké de façon
+\textbf{creuse mais équivalente au dense} : $\log P(w\mid c)$ n'est mémorisé que pour les
+$(c,w)$ de compte non nul, plus une valeur par défaut
+$\log(\alpha/(\mathrm{total}_c+\alpha V))$ pour les mots de compte nul. Ce modèle est
+\textbf{broadcasté} (\code{sc.broadcast}) : Spark l'envoie une fois par worker (lecture
+seule) au lieu de le re-sérialiser à chaque tâche.
+
+\subsection{Garantie de prédictions identiques}
+\label{sec:identite}
+Les comptes étant entiers (reproductibles au bit près) et la prédiction déterministe (même
+fonction \code{predict\_indices}), les deux versions donnent des prédictions identiques
+\emph{par construction}. \textbf{Vérifications} : le smoke test (aussi en CI) impose
+l'égalité RDD/DataFrame ; le notebook obtient \textbf{accuracy $=0.9848$} sur SMS Spam avec
+\textbf{RDD $=$ DataFrame $=$ sklearn} (prédictions identiques) ; le benchmark \code{assert}
+l'égalité des accuracy sur chacun des 16 points de mesure.
+
+% ==============================================================================
+\section{Commentaires des fragments de code clés \hfill\normalsize\textmd{[Item 2b --- 3 pts]}}
+\label{sec:fragments}
+
+\subsection{Cœur MapReduce, version RDD (\texttt{src/nb\_rdd.py})}
+Le MAP émet une paire par occurrence de mot ; le REDUCE (\code{reduceByKey}) somme.
+\begin{lstlisting}[style=py]
+# MAP : pour un doc (c, [w1, w2, w1, ...]) on émet ((c, w1), 1), ((c, w2), 1), ...
+def emit_word_class(doc):
+    c, word_indices = doc
+    for w in word_indices:
+        yield ((c, w), 1)          # une paire clé/valeur par occurrence
+
+# REDUCE : reduceByKey(add) additionne toutes les occurrences -> count_{w,c}
+word_class_counts = dict(
+    docs.flatMap(emit_word_class).reduceByKey(add).collect()
+)
+\end{lstlisting}
+
+\subsection{Cœur MapReduce, version DataFrames (\texttt{src/nb\_dataframe.py})}
+\code{explode} joue le rôle du MAP (une ligne par mot) ; \code{groupBy().count()} celui du
+REDUCE.
+\begin{lstlisting}[style=py]
+# MAP  : explode(words) -> une ligne (label, word) PAR occurrence de mot
+exploded = df.select("label", F.explode("words").alias("word"))
+# REDUCE : groupBy(label, word).count() -> count_{w,c}
+word_class_counts = {
+    (r["label"], r["word"]): r["cnt"]
+    for r in exploded.groupBy("label", "word").agg(F.count("*").alias("cnt")).collect()
+}
+\end{lstlisting}
+
+\subsection{Calcul du modèle (\texttt{src/nb\_common.py})}
+Passage des comptes entiers aux log-probabilités, avec lissage de Laplace ; factorisé pour
+être \emph{identique} dans les deux versions.
+\begin{lstlisting}[style=py]
+# Dénominateur commun à une classe : total_c + alpha * V
+denom = [class_token_totals.get(c, 0) + alpha * vocab_size for c in range(n_classes)]
+# Valeur par défaut (mot de compte nul dans la classe) : log(alpha / denom)
+log_likelihood_default = [math.log(alpha / denom[c]) for c in range(n_classes)]
+# Pour chaque (classe, mot) observé : log((count + alpha) / denom)
+for (c, w), count in word_class_counts.items():
+    log_likelihood[c][w] = math.log((count + alpha) / denom[c])
+# Priors : log P(c) = log(N_c / N)
+log_prior[c] = math.log(class_doc_counts[c] / n_docs)
+\end{lstlisting}
+
+\subsection{Broadcast du modèle et prédiction}
+Le modèle est diffusé une fois par worker, puis utilisé en lecture seule (map RDD / UDF DF).
+\begin{lstlisting}[style=py]
+# --- RDD ---
+bc_model = sc.broadcast(model)                 # diffusion en lecture seule
+preds = docs.map(lambda cw: C.predict_indices(bc_model.value, cw[1])).collect()
+
+# --- DataFrame ---
+bc_model = sc.broadcast(model)
+@F.udf(returnType=IntegerType())
+def predict_udf(words):                        # closure référençant bc_model.value
+    return int(C.predict_indices(bc_model.value, words or []))
+\end{lstlisting}
+\emph{Remarque technique} : \code{get\_spark()} appelle \code{sc.addPyFile(...)} sur nos
+modules, sans quoi les workers lèveraient \code{ModuleNotFoundError: nb\_common} lors de la
+désérialisation du modèle et de l'appel à \code{predict\_indices}.
+
+% ==============================================================================
+\section{Analyse expérimentale : scalabilité \hfill\normalsize\textmd{[Item 3 --- 3 pts]}}
+\label{sec:scalability}
+
+\subsection{Protocole}
+\begin{itemize}
+  \item \textbf{Machine} : macOS (Apple Silicon, arm64), 8 cœurs (4 \emph{performance} + 4
+        \emph{efficiency}). Spark en mode local (\code{local[k]}).
+  \item \textbf{Expérience A --- volume} : à \code{local[*]}, réplication de 20 Newsgroups par
+        un facteur $\in\{{\times}1,{\times}2,{\times}4,{\times}8\}$.
+  \item \textbf{Expérience B --- parallélisme} : à volume fixe (${\times}8$, $\sim$121\,k docs),
+        variation de \code{local[k]}, $k\in\{1,2,4,8\}$.
+  \item \textbf{Anti-fuite} : la réplication est faite \textbf{après} le découpage train/test,
+        séparément de chaque côté (un document de test ne peut jamais apparaître, même
+        dupliqué, dans l'entraînement).
+  \item \textbf{Bruit de mesure} : \code{--repeat 3} --- chaque point mesuré 3 fois, agrégé en
+        moyenne $\pm$ écart-type (barres d'erreur sur les figures).
+\end{itemize}
+Commande : \code{python src/benchmark.py --factors 1 2 4 8 --cores 1 2 4 8 --repeat 3}.
+
+\subsection{Résultats --- scalabilité en volume}
+\begin{table}[H]
+\centering\small
 \begin{tabular}{@{}rrrrrrr@{}}
 \toprule
 \textbf{Facteur} & \textbf{n\_train} & \textbf{RDD train} & \textbf{DF train} & \textbf{RDD pred} & \textbf{DF pred} & \textbf{Acc.} \\
 \midrule
-$\times 1$ & 15\,076  & $1.81 \pm 0.67$ & $3.07 \pm 1.25$ & $0.44 \pm 0.04$ & $1.39 \pm 0.27$ & 0.620 \\
-$\times 2$ & 30\,152  & $1.89 \pm 0.15$ & $3.10 \pm 0.20$ & $0.68 \pm 0.04$ & $2.01 \pm 0.19$ & 0.677 \\
-$\times 4$ & 60\,304  & $3.16 \pm 0.15$ & $5.11 \pm 0.25$ & $1.26 \pm 0.03$ & $3.42 \pm 0.21$ & 0.704 \\
-$\times 8$ & 120\,608 & $5.27 \pm 0.11$ & $8.57 \pm 0.09$ & $2.29 \pm 0.09$ & $6.91 \pm 1.10$ & 0.711 \\
+${\times}1$ & 15\,076  & $1.81\pm0.67$ & $3.07\pm1.25$ & $0.44\pm0.04$ & $1.39\pm0.27$ & 0.620 \\
+${\times}2$ & 30\,152  & $1.89\pm0.15$ & $3.10\pm0.20$ & $0.68\pm0.04$ & $2.01\pm0.19$ & 0.677 \\
+${\times}4$ & 60\,304  & $3.16\pm0.15$ & $5.11\pm0.25$ & $1.26\pm0.03$ & $3.42\pm0.21$ & 0.704 \\
+${\times}8$ & 120\,608 & $5.27\pm0.11$ & $8.57\pm0.09$ & $2.29\pm0.09$ & $6.91\pm1.10$ & 0.711 \\
 \bottomrule
 \end{tabular}
+\caption{Temps (s, moyenne $\pm$ écart-type sur 3 exécutions) selon le volume, à \code{local[*]}.}
 \end{table}
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.8\linewidth]{figures/scalability_datasize.png}
-\caption{Temps d'entraînement en fonction du volume de données (\texttt{local[*]}).}
+\begin{figure}[H]\centering
+\includegraphics[width=0.72\linewidth]{figures/scalability_datasize.png}
+\caption{Temps d'entraînement en fonction du volume (\code{local[*]}).}
 \end{figure}
+De ${\times}1$ à ${\times}8$ (8$\times$ de données), le temps d'entraînement ne croît que
+d'un facteur ${\sim}2.9$ : \textbf{passage à l'échelle sous-linéaire}. RDD est plus rapide que
+DataFrames à tous les points ; la prédiction DataFrames est ${\sim}3\times$ plus lente
+(UDF Python ligne à ligne).
 
-\begin{itemize}
-  \item De $\times 1$ à $\times 8$ (\textbf{8$\times$ de données}), le temps d'entraînement
-        n'augmente que d'un facteur $\sim 2.9$ : \textbf{passage à l'échelle sous-linéaire},
-        très favorable.
-  \item \textbf{RDD est plus rapide que DataFrame à tous les points}, avec un écart nettement
-        supérieur aux écarts-types.
-  \item La \textbf{prédiction DataFrame} est $\sim 3\times$ plus lente que la RDD : l'UDF
-        Python est invoquée et sérialisée \textbf{ligne par ligne}.
-\end{itemize}
-
-\subsection{Scalabilité en parallélisme (facteur $\times 8$, $\sim$121\,k docs)}
-
-Speed-up $= T(1) / T(k)$.
-
+\subsection{Résultats --- scalabilité en parallélisme}
 \begin{table}[H]
-\centering
+\centering\small
 \begin{tabular}{@{}rrrrrr@{}}
 \toprule
 \textbf{Cœurs} & \textbf{RDD train} & \textbf{speed-up} & \textbf{RDD pred} & \textbf{DF train} & \textbf{DF pred} \\
 \midrule
-1 & $12.66 \pm 0.30$ & $1.00\times$ & $5.00 \pm 0.04$ & $10.05 \pm 0.07$ & $12.07 \pm 0.36$ \\
-2 & $7.23 \pm 0.15$  & $1.75\times$ & $3.34 \pm 0.08$ & $9.13 \pm 0.30$  & $8.63 \pm 0.02$ \\
-4 & $5.88 \pm 0.57$  & $\mathbf{2.15\times}$ & $2.68 \pm 0.28$ & $9.18 \pm 0.27$  & $8.09 \pm 0.53$ \\
-8 & $10.97 \pm 1.51$ & $1.15\times$ & $3.48 \pm 0.51$ & $12.55 \pm 1.45$ & $8.30 \pm 0.85$ \\
+1 & $12.66\pm0.30$ & $1.00\times$ & $5.00\pm0.04$ & $10.05\pm0.07$ & $12.07\pm0.36$ \\
+2 & $7.23\pm0.15$  & $1.75\times$ & $3.34\pm0.08$ & $9.13\pm0.30$  & $8.63\pm0.02$ \\
+4 & $5.88\pm0.57$  & $\mathbf{2.15\times}$ & $2.68\pm0.28$ & $9.18\pm0.27$  & $8.09\pm0.53$ \\
+8 & $10.97\pm1.51$ & $1.15\times$ & $3.48\pm0.51$ & $12.55\pm1.45$ & $8.30\pm0.85$ \\
 \bottomrule
 \end{tabular}
+\caption{Temps (s) selon le nombre de cœurs, à volume fixe (${\times}8$). Speed-up $=T(1)/T(k)$.}
 \end{table}
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.8\linewidth]{figures/scalability_cores.png}
-\caption{Temps d'entraînement en fonction du nombre de cœurs (facteur $\times 8$).}
+\begin{figure}[H]\centering
+\includegraphics[width=0.72\linewidth]{figures/scalability_cores.png}
+\caption{Temps d'entraînement en fonction du nombre de cœurs (facteur ${\times}8$).}
 \end{figure}
+Le speed-up RDD progresse jusqu'à ${\sim}2.15\times$ à 4 cœurs, puis \textbf{régresse à 8
+cœurs} : sur Apple Silicon, \code{local[8]} embarque les 4 cœurs \emph{efficiency} (plus
+lents) et met le driver en contention, d'où un point plus lent et fortement bruité
+($\pm1.5$\,s). DataFrames ne profite quasiment pas des cœurs supplémentaires.
 
+% ==============================================================================
+\section{Points forts et points faibles des algorithmes \hfill\normalsize\textmd{[Item 4 --- 3 pts]}}
+\label{sec:forces}
+
+\subsection*{Points forts}
 \begin{itemize}
-  \item \textbf{RDD} : le speed-up progresse jusqu'à $\sim 2.15\times$ à 4 cœurs, puis
-        \textbf{régresse à 8 cœurs}. Explication matérielle : sur Apple Silicon, \code{local[8]}
-        embarque les 4 cœurs \emph{efficiency} (plus lents) et met le driver en contention
-        $\to$ point plus lent et fortement bruité ($\pm 1.5$\,s).
-  \item \textbf{DataFrame} : ne bénéficie quasiment pas des cœurs supplémentaires (Catalyst
-        parallélise déjà en interne ; l'overhead SQL + UDF domine).
+  \item \textbf{Correction et cohérence} : RDD $=$ DataFrames $=$ sklearn (vérifié) ; calcul en
+        log robuste numériquement.
+  \item \textbf{Adéquation MapReduce} : l'entraînement est un pur comptage, parfaitement
+        distribuable (map $\to$ reduceByKey / groupBy).
+  \item \textbf{Scalabilité en volume favorable} (sous-linéaire) et \textbf{avantage net de la
+        version RDD}, surtout en prédiction.
+  \item \textbf{Broadcast} du modèle creux : diffusion unique par worker, économe.
 \end{itemize}
 
-% ======================================================================
-\section{Discussion}
-
-\subsection{RDD vs DataFrames}
-Sur ce problème (comptages + prédiction par UDF), \textbf{RDD est plus rapide} que
-DataFrames, surtout en prédiction. L'API DataFrames reste plus lisible et bénéficierait
-davantage à plus grande échelle ou avec des fonctions natives Spark (sans UDF Python). Le
-point clé pédagogique --- \textbf{prédictions identiques} --- est vérifié.
-
-\subsection{Speed-up sous-linéaire}
-Le mode \code{local} fait tourner driver et exécuteurs dans \textbf{une seule JVM} ;
-« cœurs » $=$ threads. Les overheads (shuffle, sérialisation, warmup, GC) et l'hétérogénéité
-des cœurs Apple Silicon expliquent un speed-up \textbf{bien en deçà du linéaire idéal}
-($\sim 2\times$ utiles sur 4 cœurs performance).
-
-\subsection{Accuracy et réplication --- un effet de lissage}
-Après correction de la fuite, l'accuracy \textbf{ne monte plus fortement} avec le volume,
-mais elle \textbf{n'est pas parfaitement constante} ($0.620 \to 0.711$). Ce n'est
-\textbf{pas} de la fuite : répliquer le \emph{train} multiplie tous les comptes par le
-facteur $f$, si bien que $\log P(w\mid c) = \log\big((f\cdot\mathrm{count}+\alpha)/(f\cdot
-\mathrm{total}+\alpha V)\big)$ --- le lissage $\alpha=1$ devient \textbf{relativement
-négligeable} quand les comptes gonflent, donc le modèle est moins régularisé. La valeur de
-référence « honnête » est celle à $\times 1 = 0.620$. Pour une accuracy strictement plate, il
-faudrait mettre à l'échelle le lissage ($\alpha = f$) --- mais l'étude visant les
-\textbf{temps}, on conserve $\alpha = 1$ et l'on documente l'effet.
-
-% ======================================================================
-\section{Limites}
-
+\subsection*{Points faibles}
 \begin{itemize}
-  \item \textbf{Mode local uniquement} : pas de vrai cluster ; conclusions valables pour un
-        nœud multi-cœurs.
-  \item \textbf{Cœurs hétérogènes} (Apple Silicon) : le point \code{local[8]} est peu fiable.
-  \item \textbf{Prédiction DataFrame par UDF Python} : goulot d'étranglement.
-  \item \textbf{Réplication} comme proxy de « big data » : gonfle le volume mais pas la
-        diversité ; interagit avec le lissage.
+  \item \textbf{Goulot au driver} : les comptes $(c,w)$ sont \code{collect}és en mémoire du
+        driver pour construire le modèle broadcasté. Le modèle doit tenir en RAM du driver ---
+        c'est la vraie limite « big data » (acceptable ici car $V\times C$ reste modéré).
+  \item \textbf{Prédiction DataFrames par UDF Python} : sérialisation ligne à ligne, ${\sim}3\times$
+        plus lente que le \code{map} RDD ; une implémentation par jointures natives serait plus
+        rapide.
+  \item \textbf{Speed-up parallèle limité} en mode local (une seule JVM ; overheads shuffle/GC ;
+        cœurs hétérogènes). Le point \code{local[8]} est peu fiable.
+  \item \textbf{Effet du lissage sous réplication} : répliquer le train multiplie les comptes
+        par $f$, si bien que $\log P(w\mid c)=\log\big((f\cdot\mathrm{count}+\alpha)/(f\cdot
+        \mathrm{total}+\alpha V)\big)$ ; le lissage $\alpha{=}1$ devient relativement négligeable
+        et le modèle est moins régularisé. Cela explique la légère hausse de l'accuracy
+        (0.620 $\to$ 0.711) : \emph{ce n'est pas une fuite} (le test dupliqué n'apporte aucune
+        information), mais un effet de modélisation. La valeur de référence honnête est celle à
+        ${\times}1 = 0.620$.
 \end{itemize}
 
-% ======================================================================
-\section{Conclusion et pistes}
+% ==============================================================================
+\section{Conclusion}
+Naive Bayes multinomial a été implémenté en MapReduce sur Spark en deux versions cohérentes
+(prédictions identiques, alignées sur scikit-learn), avec une étude de scalabilité rigoureuse
+(anti-fuite, mesures répétées). Résultats : scaling en volume sous-linéaire, avantage de la
+version RDD, speed-up parallèle réel mais modéré (limité par le mode local et le matériel).
+Pistes : exécution sur cluster, prédiction DataFrames sans UDF Python, métriques par classe,
+mise à l'échelle du lissage.
 
-Le classifieur Naive Bayes multinomial a été implémenté en MapReduce sur Spark en deux
-versions \textbf{cohérentes} (prédictions identiques, alignées sur scikit-learn), avec une
-étude de scalabilité rigoureuse (anti-fuite, mesures répétées). Les résultats montrent un
-\textbf{scaling en volume sous-linéaire}, un \textbf{avantage de la version RDD}, et un
-\textbf{speed-up parallèle réel mais modéré} limité par le mode local et le matériel.
+% ==============================================================================
+\begin{thebibliography}{9}
+\bibitem{nbmapreduce} \emph{Naïve Bayes Classifier --- A MapReduce Approach}. Document de
+référence du cours « ML on Big Data » (D. Colazzo), Université Paris-Dauphine.
+\bibitem{sklearn} F. Pedregosa \emph{et al.}, \emph{Scikit-learn: Machine Learning in Python},
+JMLR 12, 2011. Classe \texttt{MultinomialNB}.
+\bibitem{spark} M. Zaharia \emph{et al.}, \emph{Apache Spark: A Unified Engine for Big Data
+Processing}, CACM 59(11), 2016.
+\bibitem{20ng} K. Lang, \emph{NewsWeeder: Learning to Filter Netnews} (jeu 20 Newsgroups), 1995.
+\bibitem{smsspam} T. Almeida, J. M. Gómez Hidalgo, \emph{SMS Spam Collection}, UCI ML Repository.
+\end{thebibliography}
 
-Pistes : exécution sur cluster (YARN/K8s), prédiction DataFrame sans UDF Python, métriques
-par classe (précision/rappel, matrice de confusion), comparaison temps Spark vs scikit-learn
-sur petit volume, mise à l'échelle du lissage.
+% ==============================================================================
+\appendix
+\section{Annexe : code source complet \hfill\normalsize\textmd{[Item 5 --- 4 pts]}}
+\label{sec:annexe-code}
+Le code ci-dessous reproduit \emph{tel quel} les fichiers du dépôt (fragment généré depuis
+les sources par \code{report/build\_notebook\_appendix.py}, donc synchronisé avec les
+fichiers exécutés).
 
-% ======================================================================
-\section{Reproductibilité}
+\input{code_appendix.tex}
 
-\begin{lstlisting}
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+% ==============================================================================
+\section{Annexe : notebook exécuté sur petites données \hfill\normalsize\textmd{[Item 5 --- 4 pts]}}
+\label{sec:annexe-nb}
+Reproduction du notebook \code{notebooks/demo.ipynb} \textbf{exécuté de bout en bout sur le
+petit jeu SMS Spam}, avec ses \textbf{entrées} (code) et \textbf{sorties} (résultats), et des
+commentaires sur les entrées/sorties. (Fragment généré par
+\code{report/build\_notebook\_appendix.py}.)
 
-python tests/test_smoke.py            # egalite RDD == DataFrame
-python data/download_sms_spam.py      # petit jeu (notebook)
-python data/download_20newsgroups.py  # grand jeu (benchmark)
-jupyter lab notebooks/demo.ipynb      # demo + comparaison sklearn
-
-python src/benchmark.py --factors 1 2 4 8 --cores 1 2 4 8 --repeat 3
-# -> results/results.csv + results/scalability_{datasize,cores}.png
-\end{lstlisting}
-
-Prérequis : Python 3.10--3.12 (pas 3.13+ pour pyspark 3.5) et un JDK 8/11/17 (pas 20+).
-Sur macOS, \code{get_spark()} sélectionne automatiquement le JDK 17.
+\input{notebook_appendix.tex}
 
 \end{document}

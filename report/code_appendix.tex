@@ -1,0 +1,1262 @@
+% Fichier généré par build_notebook_appendix.py — ne pas éditer à la main.
+\subsection{\texttt{src/nb\_common.py}}
+\begin{lstlisting}[style=py]
+"""
+nb_common.py
+============
+
+Briques *communes* aux deux implémentations de Naive Bayes multinomial
+(version RDD dans ``nb_rdd.py`` et version DataFrames dans ``nb_dataframe.py``).
+
+On centralise ici tout ce qui **doit être strictement identique** entre les deux
+versions pour garantir des prédictions rigoureusement égales :
+
+1. la tokenisation (bag-of-words) ;
+2. la construction du vocabulaire et de la table des étiquettes ;
+3. la vectorisation d'un document en liste d'indices de mots ;
+4. la *construction du modèle* à partir de comptes entiers (comptes -> log-probas) ;
+5. la *fonction de prédiction* d'un document à partir du modèle.
+
+Les points 4 et 5 sont volontairement écrits **une seule fois** : les versions RDD
+et DataFrames se contentent de produire, chacune à leur manière (map/reduce),
+exactement les mêmes comptes entiers, puis appellent ces fonctions communes.
+Comme les comptes sont des entiers (donc reproductibles au bit près) et que la
+prédiction est déterministe, les deux versions renvoient des prédictions
+identiques.
+
+La modélisation reproduit fidèlement ``sklearn.naive_bayes.MultinomialNB`` avec
+``alpha=1`` et ``fit_prior=True`` :
+
+    log P(c)      = log( N_c / N )
+    log P(w | c)  = log( (count_{w,c} + alpha) / (total_c + alpha * V) )
+
+où :
+    N            = nombre de documents d'entraînement
+    N_c          = nombre de documents de la classe c
+    count_{w,c}  = nombre total d'occurrences du mot w dans les docs de classe c
+    total_c      = sum_w count_{w,c}  (nombre total de tokens de la classe c)
+    V            = taille du vocabulaire
+    alpha        = paramètre de lissage de Laplace (1 par défaut)
+
+Score d'un document d pour une classe c (tout en logarithme) :
+
+    score(d, c) = log P(c) + sum_{w in d} count_w(d) * log P(w | c)
+
+La classe prédite est celle qui maximise ce score.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import subprocess
+from dataclasses import dataclass, field
+from typing import Dict, List, Sequence, Tuple
+
+# ---------------------------------------------------------------------------
+# 1. Tokenisation (bag-of-words)
+# ---------------------------------------------------------------------------
+# On reproduit la tokenisation par défaut de sklearn.CountVectorizer :
+#   - passage en minuscules,
+#   - motif r"\b\w\w+\b" : suites d'au moins 2 caractères de mot.
+# Utiliser exactement la même règle est indispensable pour pouvoir comparer nos
+# résultats à ceux de sklearn.MultinomialNB dans le notebook.
+_TOKEN_RE = re.compile(r"(?u)\b\w\w+\b")
+
+
+def tokenize(text: str) -> List[str]:
+    """Découpe un texte en liste de tokens (mots), comme sklearn CountVectorizer.
+
+    >>> tokenize("Free entry, WIN a prize!!!")
+    ['free', 'entry', 'win', 'prize']
+    """
+    if text is None:
+        return []
+    return _TOKEN_RE.findall(text.lower())
+
+
+# ---------------------------------------------------------------------------
+# 2. Vocabulaire et étiquettes
+# ---------------------------------------------------------------------------
+def build_vocabulary(
+    tokenized_docs: Sequence[Sequence[str]], min_df: int = 1
+) -> Dict[str, int]:
+    """Construit le vocabulaire {mot -> indice} à partir des documents d'entraînement.
+
+    Le vocabulaire est trié par ordre alphabétique (comme sklearn) afin que les
+    indices soient parfaitement déterministes d'une exécution à l'autre.
+
+    Paramètres
+    ----------
+    tokenized_docs : documents déjà tokenisés (liste de listes de mots).
+    min_df         : nombre minimal de documents dans lesquels un mot doit
+                     apparaître pour être conservé (1 = on garde tout).
+    """
+    # Compte le nombre de *documents* contenant chaque mot (document frequency).
+    doc_freq: Dict[str, int] = {}
+    for tokens in tokenized_docs:
+        for w in set(tokens):  # set() -> un mot compte une seule fois par doc
+            doc_freq[w] = doc_freq.get(w, 0) + 1
+
+    # On ne garde que les mots suffisamment fréquents, puis on trie -> indices stables.
+    kept = sorted(w for w, df in doc_freq.items() if df >= min_df)
+    return {w: i for i, w in enumerate(kept)}
+
+
+def build_label_index(labels: Sequence[str]) -> Dict[str, int]:
+    """Construit la table {étiquette -> entier} (triée pour être déterministe)."""
+    return {lab: i for i, lab in enumerate(sorted(set(labels)))}
+
+
+def doc_to_indices(tokens: Sequence[str], vocab: Dict[str, int]) -> List[int]:
+    """Vectorise un document en liste d'indices de mots (avec répétitions).
+
+    Les mots hors-vocabulaire (OOV) sont ignorés : cela correspond exactement au
+    comportement de sklearn, où la matrice de features a un nombre fixe de
+    colonnes défini au moment du ``fit`` sur l'ensemble d'entraînement.
+
+    Exemple : si vocab = {"free": 0, "win": 1} et tokens = ["free", "win", "free", "zzz"],
+    on renvoie [0, 1, 0] (le token OOV "zzz" est retiré).
+    """
+    out: List[int] = []
+    for w in tokens:
+        idx = vocab.get(w)
+        if idx is not None:
+            out.append(idx)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 3. Le modèle Naive Bayes (structure partagée)
+# ---------------------------------------------------------------------------
+@dataclass
+class NaiveBayesModel:
+    """Modèle Naive Bayes multinomial *dense-équivalent mais stocké creux*.
+
+    Pour respecter le lissage de Laplace, sklearn stocke une log-proba pour
+    CHAQUE (classe, mot) du vocabulaire, y compris les mots de compte nul dans
+    une classe. Ce serait coûteux (n_classes * V valeurs). On stocke donc :
+
+      - ``log_prior[c]``              : log P(c)
+      - ``log_likelihood[c][w]``      : log P(w|c) uniquement pour les mots dont
+                                        le compte est NON nul dans la classe c
+      - ``log_likelihood_default[c]`` : log P(w|c) pour tout mot de compte nul
+                                        dans la classe c
+                                        = log( alpha / (total_c + alpha * V) )
+
+    C'est rigoureusement équivalent au calcul dense de sklearn : lors de la
+    prédiction, un mot présent dans le document mais de compte nul dans la
+    classe utilise simplement la valeur ``default`` (voir ``predict_indices``).
+    Cette représentation creuse est aussi ce que l'on *broadcast* aux workers.
+    """
+
+    n_classes: int
+    n_docs: int
+    vocab_size: int
+    alpha: float
+    # index entier de classe -> étiquette d'origine (str)
+    idx_to_label: List[str]
+    log_prior: List[float]
+    # log_likelihood[c] : dict {indice_mot -> log P(w|c)} (comptes non nuls seult.)
+    log_likelihood: List[Dict[int, float]]
+    log_likelihood_default: List[float]
+
+
+def build_model(
+    *,
+    n_docs: int,
+    vocab_size: int,
+    idx_to_label: List[str],
+    class_doc_counts: Dict[int, int],
+    class_token_totals: Dict[int, int],
+    word_class_counts: Dict[Tuple[int, int], int],
+    alpha: float = 1.0,
+) -> NaiveBayesModel:
+    """Construit le modèle (log-probas) à partir de **comptes entiers**.
+
+    C'est le cœur du calcul Naive Bayes, factorisé ici pour que les versions RDD
+    et DataFrames produisent EXACTEMENT le même modèle : il leur suffit de fournir
+    les mêmes agrégats entiers (calculés en map/reduce), le reste est identique.
+
+    Paramètres (tous issus d'un comptage MapReduce dans les versions Spark)
+    ----------------------------------------------------------------------
+    n_docs             : N   (nb total de documents d'entraînement)
+    vocab_size         : V   (taille du vocabulaire)
+    idx_to_label       : correspondance indice_classe -> étiquette
+    class_doc_counts   : {c -> N_c}         nb de docs par classe
+    class_token_totals : {c -> total_c}     nb total de tokens par classe
+    word_class_counts  : {(c, w) -> count}  nb d'occurrences du mot w en classe c
+    alpha              : lissage de Laplace (1.0 par défaut)
+    """
+    n_classes = len(idx_to_label)
+
+    # --- Priors : log P(c) = log(N_c / N) -----------------------------------
+    log_prior = [0.0] * n_classes
+    for c in range(n_classes):
+        n_c = class_doc_counts.get(c, 0)
+        # Un prior nul (classe absente) donnerait log(0) = -inf ; en pratique
+        # toutes les classes sont présentes en entraînement.
+        log_prior[c] = math.log(n_c / n_docs) if n_c > 0 else float("-inf")
+
+    # --- Log-vraisemblance par mot : log P(w|c) -----------------------------
+    # Dénominateur commun à une classe : total_c + alpha * V
+    denom = [class_token_totals.get(c, 0) + alpha * vocab_size for c in range(n_classes)]
+
+    # Valeur par défaut (mot de compte nul dans la classe) : log(alpha / denom)
+    log_likelihood_default = [
+        math.log(alpha / denom[c]) if denom[c] > 0 else float("-inf")
+        for c in range(n_classes)
+    ]
+
+    # Pour chaque (classe, mot) réellement observé : log((count + alpha) / denom)
+    log_likelihood: List[Dict[int, float]] = [dict() for _ in range(n_classes)]
+    for (c, w), count in word_class_counts.items():
+        log_likelihood[c][w] = math.log((count + alpha) / denom[c])
+
+    return NaiveBayesModel(
+        n_classes=n_classes,
+        n_docs=n_docs,
+        vocab_size=vocab_size,
+        alpha=alpha,
+        idx_to_label=list(idx_to_label),
+        log_prior=log_prior,
+        log_likelihood=log_likelihood,
+        log_likelihood_default=log_likelihood_default,
+    )
+
+
+def predict_indices(model: NaiveBayesModel, token_indices: Sequence[int]) -> int:
+    """Prédit l'indice de classe d'un document (liste d'indices de mots).
+
+    Fonction PARTAGÉE par les deux versions -> prédictions identiques garanties.
+
+    On calcule, pour chaque classe c :
+
+        score(c) = log P(c) + sum_{w in doc} log P(w|c)
+
+    (chaque occurrence d'un mot ajoute son log P(w|c), ce qui revient bien à
+    multiplier par le compte du mot dans le document). On renvoie l'argmax.
+    """
+    best_c = 0
+    best_score = float("-inf")
+    for c in range(model.n_classes):
+        score = model.log_prior[c]
+        ll_c = model.log_likelihood[c]
+        default_c = model.log_likelihood_default[c]
+        for w in token_indices:
+            # get(w, default) : mot de compte nul dans la classe -> valeur lissée.
+            score += ll_c.get(w, default_c)
+        if score > best_score:
+            best_score = score
+            best_c = c
+    return best_c
+
+
+def accuracy(y_true: Sequence[int], y_pred: Sequence[int]) -> float:
+    """Exactitude (fraction de prédictions correctes)."""
+    if not y_true:
+        return 0.0
+    correct = sum(1 for a, b in zip(y_true, y_pred) if a == b)
+    return correct / len(y_true)
+
+
+# ---------------------------------------------------------------------------
+# 4. Chargement des jeux de données
+# ---------------------------------------------------------------------------
+def load_sms_spam(csv_path: str) -> Tuple[List[str], List[str]]:
+    """Charge le jeu SMS Spam Collection depuis un CSV (colonnes label,text).
+
+    Le fichier est produit par ``data/download_sms_spam.py``.
+    Renvoie (textes, étiquettes) avec étiquettes dans {"ham", "spam"}.
+    """
+    import csv
+
+    texts: List[str] = []
+    labels: List[str] = []
+    with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            labels.append(row["label"])
+            texts.append(row["text"])
+    return texts, labels
+
+
+def load_20newsgroups(
+    categories: List[str] | None = None, subset: str = "all"
+) -> Tuple[List[str], List[str]]:
+    """Charge 20 Newsgroups via scikit-learn (téléchargé/caché automatiquement).
+
+    Renvoie (textes, étiquettes) où l'étiquette est le nom de la catégorie.
+    """
+    from sklearn.datasets import fetch_20newsgroups
+
+    bunch = fetch_20newsgroups(
+        subset=subset,
+        categories=categories,
+        remove=("headers", "footers", "quotes"),  # pour un signal purement textuel
+        shuffle=True,
+        random_state=42,
+    )
+    labels = [bunch.target_names[t] for t in bunch.target]
+    return list(bunch.data), labels
+
+
+def replicate_dataset(
+    texts: List[str], labels: List[str], factor: int
+) -> Tuple[List[str], List[str]]:
+    """Duplique le jeu de données ``factor`` fois (pour l'étude de scalabilité).
+
+    Multiplier la taille des données à distribution constante permet de mesurer
+    comment le temps d'exécution évolue avec le *volume*, sans changer l'accuracy.
+    """
+    if factor <= 1:
+        return list(texts), list(labels)
+    return texts * factor, labels * factor
+
+
+# ---------------------------------------------------------------------------
+# 5. Découpage entraînement / test
+# ---------------------------------------------------------------------------
+def train_test_split_texts(
+    texts: List[str],
+    labels: List[str],
+    test_size: float = 0.2,
+    seed: int = 42,
+) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Découpe (textes, étiquettes) en ensembles d'entraînement et de test.
+
+    On délègue à sklearn pour un découpage stratifié et reproductible.
+    Renvoie (X_train, X_test, y_train, y_test).
+    """
+    from sklearn.model_selection import train_test_split
+
+    # stratify=labels garde les mêmes proportions de classes dans train et test.
+    X_train, X_test, y_train, y_test = train_test_split(
+        texts, labels, test_size=test_size, random_state=seed, stratify=labels
+    )
+    return X_train, X_test, y_train, y_test
+
+
+# ---------------------------------------------------------------------------
+# 6. Préparation commune : textes -> (indices de classe, indices de mots)
+# ---------------------------------------------------------------------------
+@dataclass
+class PreparedData:
+    """Données prêtes pour l'entraînement Spark, partagées par les deux versions."""
+
+    vocab: Dict[str, int]
+    label_to_idx: Dict[str, int]
+    idx_to_label: List[str]
+    vocab_size: int
+    # Chaque exemple : (indice_classe, [indices de mots avec répétitions])
+    train: List[Tuple[int, List[int]]]
+    test: List[Tuple[int, List[int]]]
+
+
+def prepare(
+    X_train: List[str],
+    y_train: List[str],
+    X_test: List[str],
+    y_test: List[str],
+    min_df: int = 1,
+) -> PreparedData:
+    """Tokenise, construit vocabulaire + étiquettes, et vectorise train/test.
+
+    Cette étape déterministe est faite dans le driver (les données tiennent en
+    mémoire ; c'est du prétraitement). Le vocabulaire est construit **uniquement
+    sur l'entraînement** (comme un ``fit`` sklearn), puis appliqué au test.
+    """
+    train_tokens = [tokenize(t) for t in X_train]
+    test_tokens = [tokenize(t) for t in X_test]
+
+    vocab = build_vocabulary(train_tokens, min_df=min_df)
+    label_to_idx = build_label_index(y_train)
+    idx_to_label = [lab for lab, _ in sorted(label_to_idx.items(), key=lambda kv: kv[1])]
+
+    train = [
+        (label_to_idx[lab], doc_to_indices(toks, vocab))
+        for lab, toks in zip(y_train, train_tokens)
+    ]
+    # Les étiquettes de test inconnues à l'entraînement sont improbables ici
+    # (split stratifié) ; on suppose qu'elles existent dans label_to_idx.
+    test = [
+        (label_to_idx[lab], doc_to_indices(toks, vocab))
+        for lab, toks in zip(y_test, test_tokens)
+    ]
+
+    return PreparedData(
+        vocab=vocab,
+        label_to_idx=label_to_idx,
+        idx_to_label=idx_to_label,
+        vocab_size=len(vocab),
+        train=train,
+        test=test,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. SparkSession avec le bon JDK
+# ---------------------------------------------------------------------------
+def _resolve_java_home() -> str | None:
+    """Trouve un JAVA_HOME compatible Spark 3.5 (JDK 8/11/17).
+
+    Spark 3.5 ne supporte PAS les JDK plus récents (20, 21, 23...). Sur cette
+    machine le ``java`` par défaut peut être trop récent : on force donc un JDK 17
+    via ``/usr/libexec/java_home -v 17`` (macOS).
+    """
+    # Si JAVA_HOME est déjà positionné sur un JDK supporté, on le respecte.
+    for version in ("17", "11", "1.8"):
+        try:
+            out = subprocess.run(
+                ["/usr/libexec/java_home", "-v", version],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            path = out.stdout.strip()
+            if path and os.path.isdir(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def get_spark(app_name: str = "NaiveBayesMapReduce", master: str = "local[*]"):
+    """Crée (ou récupère) une SparkSession configurée pour ce projet.
+
+    - force un JDK compatible (17) si nécessaire ;
+    - ``master`` permet de choisir le parallélisme (ex. "local[2]", "local[*]").
+    """
+    java_home = _resolve_java_home()
+    if java_home:
+        os.environ["JAVA_HOME"] = java_home
+
+    # Le worker Python doit utiliser le même interpréteur que le driver (venv).
+    import sys
+
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+
+    from pyspark.sql import SparkSession
+
+    spark = (
+        SparkSession.builder.appName(app_name)
+        .master(master)
+        # Logs moins verbeux et démarrage plus rapide en local.
+        .config("spark.ui.showConsoleProgress", "false")
+        .config("spark.sql.shuffle.partitions", "8")
+        .getOrCreate()
+    )
+
+    # Les workers exécutent nos fonctions (predict_indices) et désérialisent le
+    # modèle (dataclass NaiveBayesModel) : ils doivent donc pouvoir importer nos
+    # modules. On expédie les fichiers source du projet à tous les exécuteurs.
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    for mod in ("nb_common.py", "nb_rdd.py", "nb_dataframe.py"):
+        path = os.path.join(src_dir, mod)
+        if os.path.isfile(path):
+            spark.sparkContext.addPyFile(path)
+
+    return spark
+\end{lstlisting}
+\subsection{\texttt{src/nb\_rdd.py}}
+\begin{lstlisting}[style=py]
+"""
+nb_rdd.py
+=========
+
+Naive Bayes multinomial **en MapReduce sur des RDD Spark**.
+
+C'est la version « bas niveau » : on manipule directement des RDD et on exprime
+l'entraînement comme une suite d'opérations *map* / *reduceByKey*, qui est
+exactement l'esprit MapReduce.
+
+Idée clé — comptages par MapReduce :
+    Un document est (indice_classe, [indices de mots]).
+    * MAP    : pour chaque occurrence d'un mot w dans un doc de classe c,
+               on émet la paire clé/valeur ((c, w), 1).
+    * REDUCE : reduceByKey(add) additionne les 1 -> nombre d'occurrences de w
+               dans la classe c, soit count_{w,c}.
+    De même on compte les documents par classe et les tokens par classe.
+
+Ces agrégats entiers sont ensuite passés à ``nb_common.build_model`` (calcul des
+log-probas), puis le modèle est **broadcasté** aux workers pour la prédiction.
+"""
+
+from __future__ import annotations
+
+from operator import add
+from typing import List, Tuple
+
+import nb_common as C
+
+
+def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
+              idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8
+              ) -> C.NaiveBayesModel:
+    """Entraîne le modèle Naive Bayes en RDD (map/reduceByKey).
+
+    Paramètres
+    ----------
+    sc             : SparkContext.
+    train_data     : liste de (indice_classe, [indices de mots]).
+    vocab_size     : V, taille du vocabulaire.
+    idx_to_label   : correspondance indice_classe -> étiquette d'origine.
+    alpha          : lissage de Laplace.
+    num_partitions : nombre de partitions du RDD (parallélisme des données).
+    """
+    # On distribue les documents sur le cluster (ici local[k]) en `num_partitions`.
+    docs = sc.parallelize(train_data, numSlices=num_partitions)
+
+    # --- (a) Nombre total de documents : N ----------------------------------
+    n_docs = docs.count()
+
+    # --- (b) Nombre de documents par classe : N_c ---------------------------
+    #   MAP    : chaque doc -> (classe, 1)
+    #   REDUCE : reduceByKey(add) -> somme des 1 par classe
+    class_doc_counts = dict(
+        docs.map(lambda cw: (cw[0], 1)).reduceByKey(add).collect()
+    )
+
+    # --- (c) Nombre total de tokens par classe : total_c --------------------
+    #   MAP    : chaque doc -> (classe, nb de tokens du doc)
+    #   REDUCE : somme par classe
+    class_token_totals = dict(
+        docs.map(lambda cw: (cw[0], len(cw[1]))).reduceByKey(add).collect()
+    )
+
+    # --- (d) Compte des mots par classe : count_{w,c}  (LE cœur MapReduce) ---
+    #   MAP (flatMap) : pour un doc (c, [w1, w2, w1, ...]), on émet
+    #                   ((c, w1), 1), ((c, w2), 1), ((c, w1), 1), ...
+    #                   -> une paire par occurrence de mot.
+    #   REDUCE        : reduceByKey(add) additionne toutes les occurrences,
+    #                   donnant count_{w,c} pour chaque couple (classe, mot).
+    def emit_word_class(doc: Tuple[int, List[int]]):
+        c, word_indices = doc
+        for w in word_indices:
+            yield ((c, w), 1)
+
+    word_class_counts = dict(
+        docs.flatMap(emit_word_class).reduceByKey(add).collect()
+    )
+
+    # --- (e) Construction du modèle (comptes entiers -> log-probas) ---------
+    # Calcul factorisé dans nb_common pour être identique à la version DataFrame.
+    return C.build_model(
+        n_docs=n_docs,
+        vocab_size=vocab_size,
+        idx_to_label=idx_to_label,
+        class_doc_counts=class_doc_counts,
+        class_token_totals=class_token_totals,
+        word_class_counts=word_class_counts,
+        alpha=alpha,
+    )
+
+
+def predict_rdd(sc, model: C.NaiveBayesModel,
+                test_data: List[Tuple[int, List[int]]], num_partitions: int = 8
+                ) -> List[int]:
+    """Prédit les classes des documents de test, en parallèle sur les RDD.
+
+    Le modèle est **broadcasté** : Spark l'envoie une seule fois à chaque worker
+    (au lieu de le sérialiser avec chaque tâche), ce qui est essentiel quand le
+    modèle est volumineux (V mots x C classes).
+    """
+    # BROADCAST : diffusion du modèle en lecture seule à tous les workers.
+    bc_model = sc.broadcast(model)
+
+    docs = sc.parallelize(test_data, numSlices=num_partitions)
+
+    # MAP : chaque doc -> classe prédite, via la fonction de prédiction COMMUNE.
+    # bc_model.value récupère le modèle local au worker (pas de re-sérialisation).
+    preds = docs.map(
+        lambda cw: C.predict_indices(bc_model.value, cw[1])
+    ).collect()
+
+    bc_model.unpersist()
+    return preds
+
+
+def evaluate_rdd(sc, model: C.NaiveBayesModel,
+                 test_data: List[Tuple[int, List[int]]], num_partitions: int = 8
+                 ) -> float:
+    """Renvoie l'exactitude (accuracy) du modèle sur l'ensemble de test."""
+    y_true = [c for c, _ in test_data]
+    y_pred = predict_rdd(sc, model, test_data, num_partitions=num_partitions)
+    return C.accuracy(y_true, y_pred)
+\end{lstlisting}
+\subsection{\texttt{src/nb\_dataframe.py}}
+\begin{lstlisting}[style=py]
+"""
+nb_dataframe.py
+===============
+
+Naive Bayes multinomial **avec l'API DataFrames de Spark**.
+
+Même algorithme que ``nb_rdd.py``, mais exprimé avec des opérations
+relationnelles de haut niveau (``explode``, ``groupBy`` / ``agg``) au lieu de
+map/reduceByKey. Le moteur Catalyst optimise ces opérations.
+
+Correspondance avec la version RDD :
+    * ``explode`` d'un tableau de mots  ≈  la phase MAP (une ligne par mot) ;
+    * ``groupBy(...).agg(count/sum)``   ≈  la phase REDUCE (reduceByKey).
+
+On produit exactement les mêmes agrégats entiers que la version RDD, puis on
+appelle le MÊME ``nb_common.build_model`` et la MÊME fonction de prédiction :
+les deux versions renvoient donc des prédictions identiques.
+Le modèle est **broadcasté** aux workers pour la prédiction via une UDF.
+"""
+
+from __future__ import annotations
+
+from typing import List, Tuple
+
+from pyspark.sql import Row
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    ArrayType,
+    IntegerType,
+    StructField,
+    StructType,
+)
+
+import nb_common as C
+
+
+def _to_dataframe(spark, data: List[Tuple[int, List[int]]], num_partitions: int):
+    """Construit un DataFrame (label:int, words:array<int>) à partir des données.
+
+    Chaque ligne = un document : son indice de classe et son sac de mots (liste
+    d'indices de mots, avec répétitions).
+    """
+    schema = StructType([
+        StructField("label", IntegerType(), False),
+        StructField("words", ArrayType(IntegerType()), False),
+    ])
+    rows = [Row(label=c, words=list(w)) for c, w in data]
+    return spark.createDataFrame(rows, schema=schema).repartition(num_partitions)
+
+
+def train_dataframe(spark, train_data: List[Tuple[int, List[int]]], vocab_size: int,
+                    idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8
+                    ) -> C.NaiveBayesModel:
+    """Entraîne le modèle Naive Bayes avec l'API DataFrames (groupBy/agg)."""
+    df = _to_dataframe(spark, train_data, num_partitions)
+    df.cache()  # réutilisé plusieurs fois ci-dessous -> on le met en cache
+
+    # --- (a) Nombre total de documents : N ----------------------------------
+    n_docs = df.count()
+
+    # --- (b) Nombre de documents par classe : N_c ---------------------------
+    #   groupBy(label).count()  ≈  REDUCE : compte les lignes par classe.
+    class_doc_counts = {
+        r["label"]: r["cnt"]
+        for r in df.groupBy("label").agg(F.count("*").alias("cnt")).collect()
+    }
+
+    # --- (c) Nombre total de tokens par classe : total_c --------------------
+    #   size(words) = nb de tokens du doc ; on somme par classe.
+    class_token_totals = {
+        r["label"]: r["tot"]
+        for r in df.groupBy("label")
+        .agg(F.sum(F.size("words")).alias("tot"))
+        .collect()
+    }
+
+    # --- (d) Compte des mots par classe : count_{w,c}  (cœur MAP/REDUCE) -----
+    #   MAP    : explode(words) -> une ligne (label, word) PAR occurrence de mot
+    #            (équivaut au flatMap qui émet ((c, w), 1) de la version RDD).
+    #   REDUCE : groupBy(label, word).count() -> count_{w,c}.
+    exploded = df.select("label", F.explode("words").alias("word"))
+    word_class_counts = {
+        (r["label"], r["word"]): r["cnt"]
+        for r in exploded.groupBy("label", "word")
+        .agg(F.count("*").alias("cnt"))
+        .collect()
+    }
+
+    df.unpersist()
+
+    # --- (e) Construction du modèle (identique à la version RDD) ------------
+    return C.build_model(
+        n_docs=n_docs,
+        vocab_size=vocab_size,
+        idx_to_label=idx_to_label,
+        class_doc_counts=class_doc_counts,
+        class_token_totals=class_token_totals,
+        word_class_counts=word_class_counts,
+        alpha=alpha,
+    )
+
+
+def predict_dataframe(spark, model: C.NaiveBayesModel,
+                      test_data: List[Tuple[int, List[int]]], num_partitions: int = 8
+                      ) -> List[int]:
+    """Prédit les classes de test via une UDF s'appuyant sur le modèle broadcasté."""
+    sc = spark.sparkContext
+
+    # BROADCAST : le modèle est diffusé une fois par worker (lecture seule),
+    # au lieu d'être capturé/sérialisé pour chaque tâche.
+    bc_model = sc.broadcast(model)
+
+    # UDF : applique la fonction de prédiction COMMUNE à chaque sac de mots.
+    # La closure référence bc_model.value, résolu localement sur chaque worker.
+    @F.udf(returnType=IntegerType())
+    def predict_udf(words):
+        return int(C.predict_indices(bc_model.value, words or []))
+
+    # On attache un identifiant EXPLICITE (position dans test_data) AVANT tout
+    # shuffle, afin de pouvoir réordonner les prédictions et les aligner sur
+    # test_data, quel que soit le repartitionnement effectué par Spark.
+    schema = StructType([
+        StructField("idx", IntegerType(), False),
+        StructField("words", ArrayType(IntegerType()), False),
+    ])
+    rows_in = [Row(idx=i, words=list(w)) for i, (_, w) in enumerate(test_data)]
+    df = spark.createDataFrame(rows_in, schema=schema).repartition(num_partitions)
+
+    df = df.withColumn("pred", predict_udf(F.col("words")))
+    rows = df.select("idx", "pred").orderBy("idx").collect()
+
+    bc_model.unpersist()
+    return [r["pred"] for r in rows]
+
+
+def evaluate_dataframe(spark, model: C.NaiveBayesModel,
+                       test_data: List[Tuple[int, List[int]]], num_partitions: int = 8
+                       ) -> float:
+    """Renvoie l'exactitude (accuracy) du modèle sur l'ensemble de test."""
+    y_true = [c for c, _ in test_data]
+    y_pred = predict_dataframe(spark, model, test_data, num_partitions=num_partitions)
+    return C.accuracy(y_true, y_pred)
+\end{lstlisting}
+\subsection{\texttt{src/benchmark.py}}
+\begin{lstlisting}[style=py]
+"""
+benchmark.py
+============
+
+Étude de **scalabilité** de Naive Bayes multinomial en Spark.
+
+On fait varier deux facteurs et on mesure les temps d'entraînement et de
+prédiction pour les deux versions (RDD et DataFrames) :
+
+  1. la **taille des données**  : on réplique le jeu 20 Newsgroups plusieurs fois
+     (facteurs de réplication), pour observer le passage à l'échelle en volume ;
+  2. le **parallélisme**        : on fait varier ``local[k]`` (nombre de cœurs),
+     pour observer l'accélération (speed-up) à volume constant.
+
+Deux précautions méthodologiques importantes :
+
+  * **Pas de fuite de données** : la réplication est faite APRÈS le découpage
+    train/test, et séparément sur chaque côté. Ainsi une copie d'un document
+    d'entraînement ne peut jamais se retrouver dans le test (et inversement).
+    L'accuracy reste donc honnête et stable quel que soit le facteur de
+    réplication (elle ne doit PAS augmenter avec le volume).
+  * **Bruit de mesure** : avec ``--repeat N`` (N > 1), chaque point est mesuré
+    N fois ; on reporte la **moyenne** et l'**écart-type** des temps. Cela lisse
+    les exécutions aberrantes (variabilité système, GC de la JVM, etc.).
+
+Sorties :
+  - ``results/results.csv``               : toutes les mesures (moyennes + écarts-types) ;
+  - ``results/scalability_datasize.png``  : temps vs taille des données ;
+  - ``results/scalability_cores.png``     : temps vs nombre de cœurs (local[k]).
+
+Usage :
+    python src/benchmark.py                                   # configuration par défaut
+    python src/benchmark.py --quick                           # version rapide (petits facteurs)
+    python src/benchmark.py --factors 1 2 4 8 --cores 1 2 4 8 # benchmark complet
+    python src/benchmark.py --factors 1 2 4 8 --cores 1 2 4 8 --repeat 3  # moyenné
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import statistics
+import time
+from typing import Callable, List, Tuple
+
+import nb_common as C
+import nb_rdd
+import nb_dataframe
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+RESULTS_DIR = os.path.join(ROOT, "results")
+
+
+def _timeit(fn: Callable):
+    """Exécute ``fn`` et renvoie (résultat, temps écoulé en secondes)."""
+    t0 = time.perf_counter()
+    result = fn()
+    return result, time.perf_counter() - t0
+
+
+def _mean_std(values: List[float]) -> Tuple[float, float]:
+    """Renvoie (moyenne, écart-type de population) d'une liste de mesures.
+
+    L'écart-type vaut 0 s'il n'y a qu'une seule mesure (``--repeat 1``).
+    """
+    mean = statistics.mean(values)
+    std = statistics.pstdev(values) if len(values) > 1 else 0.0
+    return mean, std
+
+
+def run_once(master: str, factor: int, base_texts: List[str], base_labels: List[str],
+             repeat: int = 1, seed: int = 42) -> List[dict]:
+    """Mesure un point de benchmark pour un (master, facteur de réplication) donné.
+
+    Méthodologie anti-fuite : on découpe D'ABORD le jeu de base en train/test, PUIS
+    on réplique chaque côté séparément. La réplication grossit donc le volume
+    (train et test) sans jamais mélanger un document entre les deux ensembles.
+
+    Avec ``repeat > 1``, on ré-exécute l'entraînement et la prédiction ``repeat``
+    fois sur les MÊMES données (la SparkSession est réutilisée), et on agrège les
+    temps en moyenne ± écart-type.
+
+    Renvoie une liste de dicts (une ligne par version RDD/DataFrame).
+    """
+    # 1) Découpage AVANT réplication -> pas de fuite de données.
+    X_tr0, X_te0, y_tr0, y_te0 = C.train_test_split_texts(base_texts, base_labels, seed=seed)
+    # 2) Réplication INDÉPENDANTE de chaque côté pour faire grossir le volume.
+    X_tr, y_tr = C.replicate_dataset(X_tr0, y_tr0, factor)
+    X_te, y_te = C.replicate_dataset(X_te0, y_te0, factor)
+    data = C.prepare(X_tr, y_tr, X_te, y_te)
+
+    # 3) SparkSession avec le parallélisme voulu (local[k]).
+    spark = C.get_spark(app_name=f"bench-{master}-x{factor}", master=master)
+    spark.sparkContext.setLogLevel("ERROR")
+    sc = spark.sparkContext
+    # Nombre de partitions ~ proportionnel au parallélisme (au moins 4).
+    parts = max(4, sc.defaultParallelism)
+
+    rows: List[dict] = []
+    try:
+        n_train = len(data.train)
+        n_test = len(data.test)
+
+        # Accumulateurs de temps sur les ``repeat`` exécutions.
+        t_train_rdd_runs: List[float] = []
+        t_pred_rdd_runs: List[float] = []
+        t_train_df_runs: List[float] = []
+        t_pred_df_runs: List[float] = []
+        acc_rdd = acc_df = None
+
+        for _ in range(repeat):
+            # --- Version RDD ------------------------------------------------
+            model_rdd, t_train_rdd = _timeit(
+                lambda: nb_rdd.train_rdd(sc, data.train, data.vocab_size,
+                                         data.idx_to_label, num_partitions=parts)
+            )
+            acc_rdd, t_pred_rdd = _timeit(
+                lambda: nb_rdd.evaluate_rdd(sc, model_rdd, data.test, num_partitions=parts)
+            )
+
+            # --- Version DataFrame -----------------------------------------
+            model_df, t_train_df = _timeit(
+                lambda: nb_dataframe.train_dataframe(spark, data.train, data.vocab_size,
+                                                     data.idx_to_label, num_partitions=parts)
+            )
+            acc_df, t_pred_df = _timeit(
+                lambda: nb_dataframe.evaluate_dataframe(spark, model_df, data.test,
+                                                        num_partitions=parts)
+            )
+
+            t_train_rdd_runs.append(t_train_rdd)
+            t_pred_rdd_runs.append(t_pred_rdd)
+            t_train_df_runs.append(t_train_df)
+            t_pred_df_runs.append(t_pred_df)
+
+            # Contrôle de cohérence : les deux versions donnent la même accuracy.
+            assert abs(acc_rdd - acc_df) < 1e-9, (acc_rdd, acc_df)
+
+        # Agrégation moyenne ± écart-type sur les ``repeat`` exécutions.
+        m_train_rdd, s_train_rdd = _mean_std(t_train_rdd_runs)
+        m_pred_rdd, s_pred_rdd = _mean_std(t_pred_rdd_runs)
+        m_train_df, s_train_df = _mean_std(t_train_df_runs)
+        m_pred_df, s_pred_df = _mean_std(t_pred_df_runs)
+
+        common = dict(master=master, factor=factor, cores=sc.defaultParallelism,
+                      repeat=repeat, n_train=n_train, n_test=n_test,
+                      vocab_size=data.vocab_size)
+        rows.append({**common, "version": "rdd",
+                     "train_time_s": round(m_train_rdd, 4), "train_time_std": round(s_train_rdd, 4),
+                     "predict_time_s": round(m_pred_rdd, 4), "predict_time_std": round(s_pred_rdd, 4),
+                     "accuracy": round(acc_rdd, 4)})
+        rows.append({**common, "version": "dataframe",
+                     "train_time_s": round(m_train_df, 4), "train_time_std": round(s_train_df, 4),
+                     "predict_time_s": round(m_pred_df, 4), "predict_time_std": round(s_pred_df, 4),
+                     "accuracy": round(acc_df, 4)})
+
+        print(f"  [{master} x{factor}] train={n_train} (repeat={repeat}) | "
+              f"RDD train={m_train_rdd:.2f}±{s_train_rdd:.2f}s pred={m_pred_rdd:.2f}±{s_pred_rdd:.2f}s | "
+              f"DF train={m_train_df:.2f}±{s_train_df:.2f}s pred={m_pred_df:.2f}±{s_pred_df:.2f}s | "
+              f"acc={acc_rdd:.3f}")
+    finally:
+        spark.stop()
+
+    return rows
+
+
+def _plot(results: List[dict]) -> None:
+    """Génère les graphiques PNG de scalabilité (avec barres d'erreur = écart-type)."""
+    import matplotlib
+    matplotlib.use("Agg")  # backend non interactif (pas de fenêtre)
+    import matplotlib.pyplot as plt
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    # --- Graphe 1 : temps d'entraînement vs taille des données (à cores fixés) ---
+    # On prend le master ayant le plus grand nombre de mesures par facteur.
+    ref_master = max(
+        {r["master"] for r in results},
+        key=lambda m: len({r["factor"] for r in results if r["master"] == m}),
+    )
+    subset = [r for r in results if r["master"] == ref_master]
+    if len({r["factor"] for r in subset}) >= 2:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for version in ("rdd", "dataframe"):
+            pts = sorted((r for r in subset if r["version"] == version),
+                         key=lambda r: r["n_train"])
+            ax.errorbar([r["n_train"] for r in pts], [r["train_time_s"] for r in pts],
+                        yerr=[r.get("train_time_std", 0.0) for r in pts],
+                        marker="o", capsize=3, label=f"{version} (train)")
+        ax.set_xlabel("Nombre de documents d'entraînement")
+        ax.set_ylabel("Temps d'entraînement (s)")
+        ax.set_title(f"Scalabilité en volume ({ref_master})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(RESULTS_DIR, "scalability_datasize.png"), dpi=120)
+        plt.close(fig)
+
+    # --- Graphe 2 : temps vs nombre de cœurs (à facteur fixé le plus grand) ---
+    factors_with_multi_cores = [
+        f for f in {r["factor"] for r in results}
+        if len({r["cores"] for r in results if r["factor"] == f}) >= 2
+    ]
+    if factors_with_multi_cores:
+        ref_factor = max(factors_with_multi_cores)
+        subset = [r for r in results if r["factor"] == ref_factor]
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for version in ("rdd", "dataframe"):
+            pts = sorted((r for r in subset if r["version"] == version),
+                         key=lambda r: r["cores"])
+            ax.errorbar([r["cores"] for r in pts], [r["train_time_s"] for r in pts],
+                        yerr=[r.get("train_time_std", 0.0) for r in pts],
+                        marker="o", capsize=3, label=f"{version} (train)")
+        ax.set_xlabel("Nombre de cœurs (local[k])")
+        ax.set_ylabel("Temps d'entraînement (s)")
+        ax.set_title(f"Speed-up selon le parallélisme (facteur x{ref_factor})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(RESULTS_DIR, "scalability_cores.png"), dpi=120)
+        plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark de scalabilité Naive Bayes/Spark")
+    parser.add_argument("--factors", type=int, nargs="+", default=[1, 2, 4],
+                        help="Facteurs de réplication du jeu de données.")
+    parser.add_argument("--cores", type=int, nargs="+", default=[1, 2, 4],
+                        help="Nombres de cœurs pour local[k].")
+    parser.add_argument("--categories", type=str, nargs="+", default=None,
+                        help="Sous-ensemble de catégories 20 Newsgroups (défaut: toutes).")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Nombre d'exécutions par point ; les temps sont moyennés "
+                             "(moyenne ± écart-type) pour lisser le bruit de mesure.")
+    parser.add_argument("--quick", action="store_true",
+                        help="Mode rapide : 4 catégories, facteurs [1,2], cores [1,2].")
+    args = parser.parse_args()
+
+    if args.repeat < 1:
+        parser.error("--repeat doit être >= 1")
+
+    if args.quick:
+        args.categories = ["sci.space", "rec.autos", "comp.graphics", "talk.politics.misc"]
+        args.factors = [1, 2]
+        args.cores = [1, 2]
+
+    print("Chargement de 20 Newsgroups ...")
+    base_texts, base_labels = C.load_20newsgroups(categories=args.categories, subset="all")
+    print(f"  {len(base_texts)} documents, {len(set(base_labels))} classes.")
+    print(f"  repeat={args.repeat} exécution(s) par point.")
+
+    all_rows: List[dict] = []
+
+    # --- Expérience A : volume croissant à parallélisme maximal (local[*]) ---
+    print("\n=== Scalabilité en VOLUME (local[*]) ===")
+    for f in args.factors:
+        all_rows += run_once("local[*]", f, base_texts, base_labels, repeat=args.repeat)
+
+    # --- Expérience B : parallélisme croissant à volume fixe (facteur max) ---
+    print("\n=== Scalabilité en PARALLÉLISME (facteur fixe) ===")
+    fixed_factor = max(args.factors)
+    for k in args.cores:
+        all_rows += run_once(f"local[{k}]", fixed_factor, base_texts, base_labels,
+                             repeat=args.repeat)
+
+    # --- Export CSV -----------------------------------------------------------
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    csv_path = os.path.join(RESULTS_DIR, "results.csv")
+    fieldnames = ["master", "cores", "factor", "repeat", "version", "n_train", "n_test",
+                  "vocab_size", "train_time_s", "train_time_std",
+                  "predict_time_s", "predict_time_std", "accuracy"]
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+    print(f"\nMesures écrites dans {csv_path}")
+
+    # --- Graphiques -----------------------------------------------------------
+    _plot(all_rows)
+    print(f"Graphiques écrits dans {RESULTS_DIR}/ (PNG).")
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+\subsection{\texttt{tests/test\_smoke.py}}
+\begin{lstlisting}[style=py]
+"""
+test_smoke.py
+=============
+
+Smoke test : vérifie de bout en bout que les DEUX versions (RDD et DataFrames)
+- s'entraînent sur un mini-jeu de 20 lignes,
+- produisent EXACTEMENT le même modèle et donc la même accuracy.
+
+Exécutable directement (``python tests/test_smoke.py``) ou via pytest
+(``pytest tests/test_smoke.py``).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+# Rendre le dossier src importable (nb_common, nb_rdd, nb_dataframe).
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(os.path.dirname(HERE), "src")
+sys.path.insert(0, SRC)
+
+import nb_common as C          # noqa: E402
+import nb_rdd                   # noqa: E402
+import nb_dataframe            # noqa: E402
+
+
+# --- Mini-jeu de données : 20 messages étiquetés spam/ham -------------------
+# Volontairement séparable pour que la prédiction ait du sens sur si peu de data.
+MINI_TEXTS = [
+    "win a free prize now",
+    "free money win cash prize",
+    "claim your free lottery prize",
+    "congratulations you won free cash",
+    "urgent free offer claim now",
+    "win big money free entry",
+    "free tickets claim your prize",
+    "cash prize winner claim now",
+    "exclusive free offer win now",
+    "you won a free vacation prize",
+    "hey are we still meeting today",
+    "call me when you get home",
+    "lunch tomorrow at noon sounds good",
+    "can you send me the report please",
+    "happy birthday see you tonight",
+    "the meeting is moved to friday",
+    "thanks for your help yesterday",
+    "i will be late for dinner",
+    "did you finish the homework yet",
+    "see you at the office monday",
+]
+MINI_LABELS = (["spam"] * 10) + (["ham"] * 10)
+
+
+def run() -> None:
+    # Démarrage d'une SparkSession locale utilisant tous les cœurs (local[*]).
+    spark = C.get_spark(app_name="SmokeTest", master="local[*]")
+    spark.sparkContext.setLogLevel("ERROR")  # logs Spark discrets
+    sc = spark.sparkContext
+
+    try:
+        # Découpage train/test reproductible, puis vectorisation commune.
+        X_tr, X_te, y_tr, y_te = C.train_test_split_texts(
+            MINI_TEXTS, MINI_LABELS, test_size=0.3, seed=0
+        )
+        data = C.prepare(X_tr, y_tr, X_te, y_te)
+
+        # Entraînement des deux versions sur EXACTEMENT les mêmes données.
+        model_rdd = nb_rdd.train_rdd(
+            sc, data.train, data.vocab_size, data.idx_to_label
+        )
+        model_df = nb_dataframe.train_dataframe(
+            spark, data.train, data.vocab_size, data.idx_to_label
+        )
+
+        # Évaluation.
+        acc_rdd = nb_rdd.evaluate_rdd(sc, model_rdd, data.test)
+        acc_df = nb_dataframe.evaluate_dataframe(spark, model_df, data.test)
+
+        # Prédictions brutes (doivent être identiques ligne à ligne).
+        pred_rdd = nb_rdd.predict_rdd(sc, model_rdd, data.test)
+        pred_df = nb_dataframe.predict_dataframe(spark, model_df, data.test)
+
+        print(f"Taille vocabulaire : {data.vocab_size}")
+        print(f"Train / Test       : {len(data.train)} / {len(data.test)}")
+        print(f"Accuracy RDD       : {acc_rdd:.4f}")
+        print(f"Accuracy DataFrame : {acc_df:.4f}")
+        print(f"Prédictions RDD    : {pred_rdd}")
+        print(f"Prédictions DF     : {pred_df}")
+
+        # --- Assertions du smoke test ---------------------------------------
+        assert acc_rdd == acc_df, (
+            f"Accuracies différentes : RDD={acc_rdd} vs DF={acc_df}"
+        )
+        assert pred_rdd == pred_df, (
+            "Les prédictions ligne à ligne diffèrent entre RDD et DataFrame."
+        )
+        print("\nOK : RDD et DataFrame donnent des prédictions et une accuracy identiques.")
+    finally:
+        spark.stop()
+
+
+def test_smoke():
+    """Point d'entrée pytest."""
+    run()
+
+
+if __name__ == "__main__":
+    run()
+\end{lstlisting}
+\subsection{\texttt{data/download\_sms\_spam.py}}
+\begin{lstlisting}[style=py]
+"""
+download_sms_spam.py
+====================
+
+Télécharge le jeu de données **SMS Spam Collection** (UCI) et l'exporte en CSV
+(``data/sms_spam.csv``) avec deux colonnes : ``label`` (ham/spam) et ``text``.
+
+C'est le PETIT jeu de données, utilisé par le notebook de démonstration et le
+smoke test. Il ne nécessite pas de cluster.
+
+Usage :
+    python data/download_sms_spam.py
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import os
+import urllib.request
+import zipfile
+
+# Miroir officiel UCI de la SMS Spam Collection (fichier zip contenant un TSV).
+URL = "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip"
+# URL de repli (autre miroir historique).
+FALLBACK_URL = (
+    "https://raw.githubusercontent.com/justmarkham/pycon-2016-tutorial/master/"
+    "data/sms.tsv"
+)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT_CSV = os.path.join(HERE, "sms_spam.csv")
+
+
+def _rows_from_zip(raw: bytes):
+    """Extrait les lignes (label, text) du zip UCI (fichier 'SMSSpamCollection')."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        # Le zip contient un fichier tabulé : "<label>\t<message>" par ligne.
+        name = next(n for n in zf.namelist() if "SMSSpamCollection" in n)
+        with zf.open(name) as fh:
+            for line in io.TextIOWrapper(fh, encoding="utf-8"):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                label, _, text = line.partition("\t")
+                yield label.strip(), text
+
+
+def _rows_from_tsv(raw: bytes):
+    """Extrait les lignes (label, text) du miroir TSV de repli."""
+    for line in io.StringIO(raw.decode("utf-8")):
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        label, _, text = line.partition("\t")
+        yield label.strip(), text
+
+
+def main() -> None:
+    print(f"Téléchargement depuis {URL} ...")
+    try:
+        with urllib.request.urlopen(URL, timeout=60) as resp:
+            raw = resp.read()
+        rows = list(_rows_from_zip(raw))
+    except Exception as exc:  # pragma: no cover - dépend du réseau
+        print(f"  échec ({exc}); tentative sur le miroir de repli...")
+        with urllib.request.urlopen(FALLBACK_URL, timeout=60) as resp:
+            raw = resp.read()
+        rows = list(_rows_from_tsv(raw))
+
+    # Écriture du CSV normalisé (en-tête label,text).
+    with open(OUT_CSV, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["label", "text"])
+        writer.writerows(rows)
+
+    n_spam = sum(1 for lab, _ in rows if lab == "spam")
+    print(f"OK : {len(rows)} messages écrits dans {OUT_CSV} "
+          f"({n_spam} spam / {len(rows) - n_spam} ham).")
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+\subsection{\texttt{data/download\_20newsgroups.py}}
+\begin{lstlisting}[style=py]
+"""
+download_20newsgroups.py
+========================
+
+Pré-télécharge (met en cache) le jeu de données **20 Newsgroups** via
+scikit-learn. C'est le GRAND jeu de données utilisé pour l'étude de scalabilité
+(``src/benchmark.py``).
+
+scikit-learn met les données en cache dans ``~/scikit_learn_data`` ; ce script
+force simplement ce téléchargement une fois pour toutes et affiche un résumé.
+
+Usage :
+    python data/download_20newsgroups.py
+"""
+
+from __future__ import annotations
+
+from sklearn.datasets import fetch_20newsgroups
+
+
+def main() -> None:
+    print("Téléchargement / mise en cache de 20 Newsgroups via scikit-learn ...")
+    # subset="all" = train + test réunis. remove=(...) enlève en-têtes/pieds/citations
+    # pour ne garder qu'un signal textuel (évite un sur-apprentissage trivial).
+    bunch = fetch_20newsgroups(
+        subset="all",
+        remove=("headers", "footers", "quotes"),
+        shuffle=True,
+        random_state=42,
+    )
+    print(f"OK : {len(bunch.data)} documents, {len(bunch.target_names)} catégories.")
+    print("Catégories :")
+    for name in bunch.target_names:
+        print(f"  - {name}")
+    print("\nLes données sont en cache (~/scikit_learn_data) et prêtes pour le benchmark.")
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}

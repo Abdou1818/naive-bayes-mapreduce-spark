@@ -1,0 +1,250 @@
+% Fichier généré par build_notebook_appendix.py — ne pas éditer à la main.
+\medskip\noindent\textbf{\Large Naive Bayes multinomial en MapReduce sur Spark --- Démonstration}\par
+
+Ce notebook tourne \textbf{de bout en bout sur les PETITES données (SMS Spam)}, \textbf{sans cluster}\par
+(Spark en mode \texttt{local[*]}). Il montre :\par
+
+1. le chargement et la vectorisation (bag-of-words) ;\par
+2. l'entraînement \textbf{en RDD} (\texttt{map}/\texttt{reduceByKey}) ;\par
+3. l'entraînement \textbf{en DataFrames} (\texttt{explode} + \texttt{groupBy}/\texttt{agg} + broadcast) ;\par
+4. la vérification que les \textbf{deux versions donnent des prédictions identiques} ;\par
+5. la \textbf{comparaison à \texttt{sklearn.naive\_bayes.MultinomialNB}}.\par
+
+\textit{Prérequis : venv installé (\texttt{requirements.txt}) et un JDK 8/11/17. Le petit jeu SMS Spam}\par
+\textit{est téléchargé automatiquement par la première cellule s'il est absent.}\par
+\medskip\noindent\textbf{\large 0. Configuration : rendre \texttt{src/} importable et télécharger les données si besoin}\par
+
+\noindent\textbf{Entrée [1]}
+\begin{lstlisting}[language=Python]
+import os, sys, subprocess
+
+# Racine du projet = dossier parent de notebooks/
+ROOT = os.path.abspath(os.path.join(os.getcwd(), ".." if os.path.basename(os.getcwd()) == "notebooks" else "."))
+SRC = os.path.join(ROOT, "src")
+sys.path.insert(0, SRC)
+
+# Télécharger le petit jeu SMS Spam s'il n'existe pas encore.
+sms_csv = os.path.join(ROOT, "data", "sms_spam.csv")
+if not os.path.exists(sms_csv):
+    print("SMS Spam absent -> téléchargement ...")
+    subprocess.run([sys.executable, os.path.join(ROOT, "data", "download_sms_spam.py")], check=True)
+print("Données :", sms_csv, "->", "OK" if os.path.exists(sms_csv) else "MANQUANT")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [1]}
+\begin{lstlisting}[style=nboutput]
+Données : /Users/abdrahamanecamara/Documents/Dauphine/Projet ML/data/sms_spam.csv -> OK
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 1. Chargement et préparation des données}\par
+
+On charge les SMS (étiquettes \texttt{ham}/\texttt{spam}), on découpe en train/test (stratifié,\par
+reproductible), puis on \textbf{tokenise} et on construit le \textbf{vocabulaire} sur l'entraînement.\par
+Chaque document devient une liste d'indices de mots (bag-of-words).\par
+
+\noindent\textbf{Entrée [2]}
+\begin{lstlisting}[language=Python]
+import nb_common as C
+
+texts, labels = C.load_sms_spam(sms_csv)
+print(f"{len(texts)} messages | spam={labels.count('spam')} ham={labels.count('ham')}")
+
+# Découpage train/test reproductible (80/20, stratifié).
+X_tr, X_te, y_tr, y_te = C.train_test_split_texts(texts, labels, test_size=0.2, seed=42)
+
+# Tokenisation + vocabulaire + vectorisation en indices de mots (partagé par les 2 versions).
+data = C.prepare(X_tr, y_tr, X_te, y_te)
+print(f"Vocabulaire : {data.vocab_size} mots")
+print(f"Train / Test : {len(data.train)} / {len(data.test)} documents")
+print("Classes :", data.idx_to_label)
+
+# Exemple : un document vectorisé (classe, premiers indices de mots)
+c0, w0 = data.train[0]
+print("Exemple doc -> classe", data.idx_to_label[c0], "| indices mots:", w0[:15], "...")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [2]}
+\begin{lstlisting}[style=nboutput]
+5574 messages | spam=747 ham=4827
+Vocabulaire : 7716 mots
+Train / Test : 4459 / 1115 documents
+Classes : ['ham', 'spam']
+Exemple doc -> classe ham | indices mots: [4917, 947, 4936, 6783, 7376, 6900, 3496, 3446, 3446] ...
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 2. Démarrage de Spark (local, sans cluster)}\par
+
+\texttt{get\_spark} sélectionne automatiquement un JDK compatible (17) et expédie nos modules\par
+Python aux workers. Le mode \texttt{local[*]} utilise tous les cœurs de la machine.\par
+
+\noindent\textbf{Entrée [3]}
+\begin{lstlisting}[language=Python]
+spark = C.get_spark(app_name="demo-sms", master="local[*]")
+spark.sparkContext.setLogLevel("ERROR")
+sc = spark.sparkContext
+print("Spark", spark.version, "| parallélisme =", sc.defaultParallelism, "cœurs")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [3]}
+\begin{lstlisting}[style=nboutput]
+26/07/08 21:23:35 WARN Utils: Your hostname, Macbook-Abdrahamane.local resolves to a loopback address: 127.0.0.1; using 192.168.0.32 instead (on interface en0)
+26/07/08 21:23:35 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/07/08 21:23:35 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+Spark 3.5.8 | parallélisme = 8 cœurs
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 3. Version RDD --- \texttt{map} / \texttt{reduceByKey}}\par
+
+Le cœur MapReduce : pour chaque occurrence d'un mot \texttt{w} dans un document de classe \texttt{c},\par
+on émet \texttt{((c, w), 1)} (\textbf{map}), puis \texttt{reduceByKey(add)} additionne les occurrences\par
+(\textbf{reduce}) pour obtenir \texttt{count\_\{w,c\}}. Le modèle (log-probas) est ensuite construit\par
+puis \textbf{broadcasté} pour la prédiction.\par
+
+\noindent\textbf{Entrée [4]}
+\begin{lstlisting}[language=Python]
+import nb_rdd
+
+model_rdd = nb_rdd.train_rdd(sc, data.train, data.vocab_size, data.idx_to_label)
+acc_rdd = nb_rdd.evaluate_rdd(sc, model_rdd, data.test)
+print(f"[RDD] accuracy test = {acc_rdd:.4f}")
+
+# Aperçu du modèle : priors log P(c)
+for c, lab in enumerate(model_rdd.idx_to_label):
+    print(f"  log P({lab}) = {model_rdd.log_prior[c]:.4f}")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [4]}
+\begin{lstlisting}[style=nboutput]
+[RDD] accuracy test = 0.9848
+  log P(ham) = -0.1440
+  log P(spam) = -2.0091
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 4. Version DataFrames --- \texttt{explode} / \texttt{groupBy}-\texttt{agg}}\par
+
+Même algorithme, exprimé en relationnel : \texttt{explode(words)} produit une ligne par mot\par
+(\textbf{map}), \texttt{groupBy(label, word).count()} agrège (\textbf{reduce}). La prédiction utilise une\par
+\textbf{UDF} s'appuyant sur le modèle \textbf{broadcasté}.\par
+
+\noindent\textbf{Entrée [5]}
+\begin{lstlisting}[language=Python]
+import nb_dataframe
+
+model_df = nb_dataframe.train_dataframe(spark, data.train, data.vocab_size, data.idx_to_label)
+acc_df = nb_dataframe.evaluate_dataframe(spark, model_df, data.test)
+print(f"[DataFrame] accuracy test = {acc_df:.4f}")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [5]}
+\begin{lstlisting}[style=nboutput]
+[DataFrame] accuracy test = 0.9848
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 5. Vérification : RDD et DataFrames donnent des prédictions identiques}\par
+
+\noindent\textbf{Entrée [6]}
+\begin{lstlisting}[language=Python]
+pred_rdd = nb_rdd.predict_rdd(sc, model_rdd, data.test)
+pred_df = nb_dataframe.predict_dataframe(spark, model_df, data.test)
+
+print("Accuracy identique :", acc_rdd == acc_df, f"({acc_rdd:.4f})")
+print("Prédictions identiques (ligne à ligne) :", pred_rdd == pred_df)
+assert pred_rdd == pred_df, "Les deux versions doivent prédire exactement pareil !"
+print("OK ✅")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [6]}
+\begin{lstlisting}[style=nboutput]
+Accuracy identique : True (0.9848)
+Prédictions identiques (ligne à ligne) : True
+OK ✅
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 6. Comparaison avec \texttt{sklearn.naive\_bayes.MultinomialNB}}\par
+
+On entraîne sklearn avec \textbf{le même vocabulaire et la même tokenisation}, et le même\par
+lissage (\texttt{alpha=1}). Notre implémentation reproduit MultinomialNB : les prédictions\par
+doivent coïncider.\par
+
+\noindent\textbf{Entrée [7]}
+\begin{lstlisting}[language=Python]
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.metrics import accuracy_score
+
+# Même vocabulaire (celui construit sur le train) + même tokenizer que nos versions Spark.
+cv = CountVectorizer(tokenizer=C.tokenize, vocabulary=data.vocab,
+                     token_pattern=None, lowercase=False)
+Xtr = cv.transform(X_tr)
+Xte = cv.transform(X_te)
+
+y_tr_idx = [data.label_to_idx[l] for l in y_tr]
+y_te_idx = [data.label_to_idx[l] for l in y_te]
+
+clf = MultinomialNB(alpha=1.0)
+clf.fit(Xtr, y_tr_idx)
+pred_sk = list(clf.predict(Xte))
+
+acc_sk = accuracy_score(y_te_idx, pred_sk)
+print(f"[sklearn]   accuracy test = {acc_sk:.4f}")
+print(f"[RDD/DF]    accuracy test = {acc_rdd:.4f}")
+print("Prédictions Spark == sklearn :", [int(p) for p in pred_rdd] == [int(p) for p in pred_sk])
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [7]}
+\begin{lstlisting}[style=nboutput]
+[sklearn]   accuracy test = 0.9848
+[RDD/DF]    accuracy test = 0.9848
+Prédictions Spark == sklearn : True
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 7. Prédiction sur de nouveaux messages}\par
+
+On applique le modèle RDD (identique au DataFrame) à quelques messages inédits.\par
+
+\noindent\textbf{Entrée [8]}
+\begin{lstlisting}[language=Python]
+nouveaux = [
+    "Congratulations! You have WON a free prize, claim now!!!",
+    "Hey, are we still on for lunch tomorrow?",
+    "URGENT: your account needs verification, click this link to win cash",
+    "Can you send me the slides before the meeting?",
+]
+# Vectorisation identique au pipeline d'entraînement.
+new_indices = [C.doc_to_indices(C.tokenize(t), data.vocab) for t in nouveaux]
+for txt, idxs in zip(nouveaux, new_indices):
+    c = C.predict_indices(model_rdd, idxs)
+    print(f"[{data.idx_to_label[c]:>4}]  {txt}")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [8]}
+\begin{lstlisting}[style=nboutput]
+[spam]  Congratulations! You have WON a free prize, claim now!!!
+[ ham]  Hey, are we still on for lunch tomorrow?
+[spam]  URGENT: your account needs verification, click this link to win cash
+[ ham]  Can you send me the slides before the meeting?
+\end{lstlisting}
+
+
+\noindent\textbf{Entrée [9]}
+\begin{lstlisting}[language=Python]
+spark.stop()
+print("SparkSession arrêtée.")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [9]}
+\begin{lstlisting}[style=nboutput]
+SparkSession arrêtée.
+\end{lstlisting}
+
