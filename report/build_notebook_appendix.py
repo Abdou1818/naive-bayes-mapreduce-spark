@@ -27,7 +27,8 @@ OUT_CODE = os.path.join(HERE, "code_appendix.tex")
 # Fichiers source inclus dans l'annexe « tout le code » (item 5 du barème).
 SOURCE_FILES = [
     "src/nb_common.py", "src/nb_rdd.py", "src/nb_dataframe.py", "src/benchmark.py",
-    "tests/test_smoke.py", "data/download_sms_spam.py", "data/download_20newsgroups.py",
+    "src/uci_experiment.py", "tests/test_smoke.py",
+    "data/download_sms_spam.py", "data/download_20newsgroups.py", "data/download_uci.py",
 ]
 
 # Symboles Unicode non gérés directement en mode texte par inputenc : on les
@@ -38,6 +39,8 @@ _TEXT_MAP = {
     "—": "---", "–": "--", "→": r"$\rightarrow$",
     "≈": r"$\approx$", "±": r"$\pm$", "×": r"$\times$",
     "…": "...", "✓": "v",
+    "α": r"$\alpha$", "β": r"$\beta$", "·": r"$\cdot$",
+    "≤": r"$\leq$", "≥": r"$\geq$", "≠": r"$\neq$", "∑": r"$\sum$",
 }
 _ALLOWED_EXTRA = {"œ", "Œ"}  # œ, Œ
 

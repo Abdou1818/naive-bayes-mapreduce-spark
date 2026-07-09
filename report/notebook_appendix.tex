@@ -90,11 +90,11 @@ print("Spark", spark.version, "| parallélisme =", sc.defaultParallelism, "cœur
 
 \noindent\textit{Sortie [3]}
 \begin{lstlisting}[style=nboutput]
-26/07/08 21:23:35 WARN Utils: Your hostname, Macbook-Abdrahamane.local resolves to a loopback address: 127.0.0.1; using 192.168.0.32 instead (on interface en0)
-26/07/08 21:23:35 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+26/07/09 16:03:36 WARN Utils: Your hostname, Macbook-Abdrahamane.local resolves to a loopback address: 127.0.0.1; using 192.168.0.32 instead (on interface en0)
+26/07/09 16:03:36 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
 Setting default log level to "WARN".
 To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
-26/07/08 21:23:35 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/07/09 16:03:36 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
 Spark 3.5.8 | parallélisme = 8 cœurs
 \end{lstlisting}
 
@@ -235,15 +235,125 @@ for txt, idxs in zip(nouveaux, new_indices):
 [ ham]  Can you send me the slides before the meeting?
 \end{lstlisting}
 
+\medskip\noindent\textbf{\large 8. Métriques détaillées : précision, rappel, F1, matrice de confusion}\par
+
+L'accuracy seule masque le comportement par classe (surtout si les classes sont\par
+déséquilibrées, comme ham/spam). On calcule donc, comme le papier de référence\par
+(Zheng 2014, §2.3.3), la \textbf{précision}, le \textbf{rappel}, la \textbf{F1} et la **matrice\par
+de confusion** sur les prédictions de la version RDD.\par
 
 \noindent\textbf{Entrée [9]}
+\begin{lstlisting}[language=Python]
+y_true = [c for c, _ in data.test]
+prf = C.precision_recall_f1(y_true, pred_rdd, len(data.idx_to_label))
+
+print("Matrice de confusion (lignes = vraie classe, colonnes = prédite) :")
+for i, row in enumerate(prf["confusion_matrix"]):
+    print(f"  {data.idx_to_label[i]:>4} | {row}")
+print()
+for c, lab in enumerate(data.idx_to_label):
+    m = prf["per_class"][c]
+    print(f"  {lab:>4} : précision={m['precision']:.3f}  rappel={m['recall']:.3f}  F1={m['f1']:.3f}")
+print(f"\nMacro-F1 : {prf['macro_f1']:.3f}")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [9]}
+\begin{lstlisting}[style=nboutput]
+Matrice de confusion (lignes = vraie classe, colonnes = prédite) :
+   ham | [963, 3]
+  spam | [14, 135]
+
+   ham : précision=0.986  rappel=0.997  F1=0.991
+  spam : précision=0.978  rappel=0.906  F1=0.941
+
+Macro-F1 : 0.966
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 9. Validation croisée k-fold}\par
+
+Un unique découpage train/test peut être biaisé. Comme le papier (§3.3.2, 6-fold),\par
+on évalue en \textbf{validation croisée} : on moyenne l'accuracy sur \texttt{k} plis\par
+(\$\textbackslash\{\}pm\$ écart-type). On réutilise la version RDD.\par
+
+\noindent\textbf{Entrée [10]}
+\begin{lstlisting}[language=Python]
+import statistics
+
+accs = []
+for X_tr_f, y_tr_f, X_te_f, y_te_f in C.kfold_split(texts, labels, k=5, seed=42):
+    d = C.prepare(X_tr_f, y_tr_f, X_te_f, y_te_f)
+    m = nb_rdd.train_rdd(sc, d.train, d.vocab_size, d.idx_to_label)
+    accs.append(nb_rdd.evaluate_rdd(sc, m, d.test))
+
+print("Accuracy par pli :", [f"{a:.3f}" for a in accs])
+print(f"Accuracy 5-fold  : {statistics.mean(accs):.4f} ± {statistics.pstdev(accs):.4f}")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [10]}
+\begin{lstlisting}[style=nboutput]
+Accuracy par pli : ['0.986', '0.986', '0.989', '0.982', '0.990']
+Accuracy 5-fold  : 0.9865 ± 0.0029
+\end{lstlisting}
+
+\medskip\noindent\textbf{\large 10. Variante du papier : Naive Bayes \textbf{catégoriel} sur un jeu UCI}\par
+
+Le papier applique en réalité Naive Bayes à des jeux \textbf{tabulaires catégoriels}\par
+(mushroom, adult...). On en fait une démonstration compacte sur \textbf{mushroom} : même\par
+comptage MapReduce, mais modèle \texttt{build\_model\_categorical}\par
+(\texttt{P(A\_i=a|c) = (count+\$\textbackslash\{\}alpha\$)/(N\_c+\$\textbackslash\{\}alpha\$\$\textbackslash\{\}cdot\$D\_i)}), branché via \texttt{model\_builder}. On vérifie\par
+là aussi que RDD et DataFrames coïncident.\par
+
+\noindent\textbf{Entrée [11]}
+\begin{lstlisting}[language=Python]
+import os, subprocess, functools
+
+# Télécharge le petit jeu mushroom si absent (tabulaire, catégoriel).
+mush = os.path.join(ROOT, "data", "uci", "mushroom.data")
+if not os.path.exists(mush):
+    subprocess.run([sys.executable, os.path.join(ROOT, "data", "download_uci.py")], check=True)
+
+from uci_experiment import load_uci
+rows, mlabels, continuous = load_uci("mushroom")   # 8124 instances, 22 attributs
+Xtr, Xte = rows[:6000], rows[6000:]
+ytr, yte = mlabels[:6000], mlabels[6000:]
+
+tab = C.prepare_tabular(Xtr, ytr, Xte, yte)
+cat_builder = functools.partial(C.build_model_categorical,
+    feature_attr=tab.feature_attr, attr_domain_sizes=tab.attr_domain_sizes)
+
+cm_rdd = nb_rdd.train_rdd(sc, tab.train, tab.vocab_size, tab.idx_to_label, model_builder=cat_builder)
+cm_df  = nb_dataframe.train_dataframe(spark, tab.train, tab.vocab_size, tab.idx_to_label, model_builder=cat_builder)
+cp_rdd = nb_rdd.predict_rdd(sc, cm_rdd, tab.test)
+cp_df  = nb_dataframe.predict_dataframe(spark, cm_df, tab.test)
+
+yte_idx = [c for c, _ in tab.test]
+print("Classes            :", tab.idx_to_label, "(e=comestible, p=vénéneux)")
+print("RDD == DataFrame   :", cp_rdd == cp_df)
+print(f"Accuracy (mushroom): {C.accuracy(yte_idx, cp_rdd):.4f}")
+prf_m = C.precision_recall_f1(yte_idx, cp_rdd, len(tab.idx_to_label))
+print(f"Macro-F1           : {prf_m['macro_f1']:.4f}")
+\end{lstlisting}
+
+
+\noindent\textit{Sortie [11]}
+\begin{lstlisting}[style=nboutput]
+Classes            : ['e', 'p'] (e=comestible, p=vénéneux)
+RDD == DataFrame   : True
+Accuracy (mushroom): 0.9096
+Macro-F1           : 0.8700
+\end{lstlisting}
+
+
+\noindent\textbf{Entrée [12]}
 \begin{lstlisting}[language=Python]
 spark.stop()
 print("SparkSession arrêtée.")
 \end{lstlisting}
 
 
-\noindent\textit{Sortie [9]}
+\noindent\textit{Sortie [12]}
 \begin{lstlisting}[style=nboutput]
 SparkSession arrêtée.
 \end{lstlisting}

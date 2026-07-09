@@ -20,13 +20,16 @@ modèle reproduit `sklearn.naive_bayes.MultinomialNB` (vérifié dans le noteboo
 
 ```
 src/
-  nb_common.py       # tokenisation, vocabulaire, split, build_model, predict_indices, get_spark (partagés)
+  nb_common.py       # tokenisation, vocabulaire, split, build_model(_categorical), predict_indices,
+                     #   métriques (P/R/F1, confusion), validation croisée, discrétisation, get_spark
   nb_rdd.py          # entraînement + prédiction en RDD (flatMap / reduceByKey + broadcast)
   nb_dataframe.py    # même algo en DataFrames (explode / groupBy-agg + UDF sur modèle broadcasté)
   benchmark.py       # scalabilité (volume × local[k], --repeat N) -> results/results.csv + PNG
+  uci_experiment.py  # variante NB CATÉGORIEL (papier) sur jeux UCI : CV k-fold + métriques
 data/
-  download_sms_spam.py       # SMS Spam Collection -> data/sms_spam.csv (PETIT jeu)
-  download_20newsgroups.py   # met en cache 20 Newsgroups via scikit-learn (GRAND jeu)
+  download_sms_spam.py       # SMS Spam Collection -> data/sms_spam.csv (PETIT jeu, multinomial)
+  download_20newsgroups.py   # met en cache 20 Newsgroups via scikit-learn (GRAND jeu, scalabilité)
+  download_uci.py            # mushroom/car/nursery/adult -> data/uci/ (variante catégorielle)
 notebooks/
   demo.ipynb         # démo exécutable de bout en bout sur PETITES données + comparaison sklearn
 tests/
@@ -90,6 +93,17 @@ python src/benchmark.py --quick                               # rapide (4 catég
 python src/benchmark.py --factors 1 2 4 8 --cores 1 2 4 8 --repeat 3   # complet
 # -> results/results.csv + results/scalability_{datasize,cores}.png
 ```
+
+**Variante Naive Bayes catégoriel** (jeux tabulaires du papier, CV k-fold + métriques) :
+
+```bash
+python data/download_uci.py                     # récupère mushroom/car/nursery/adult
+python src/uci_experiment.py --folds 6          # -> results/uci_results.csv
+python src/uci_experiment.py --dataset mushroom --folds 6   # un seul jeu
+```
+
+Le projet couvre **deux lois** partageant le même cœur MapReduce : **multinomial** (texte,
+SMS/20NG) et **catégoriel** (tabulaire UCI, avec discrétisation des attributs continus).
 
 ## Reproduire le rapport PDF
 

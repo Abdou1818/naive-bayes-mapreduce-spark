@@ -54,6 +54,10 @@
     {»}{{\guillemotright}}1 {—}{{---}}1 {–}{{--}}1 {±}{{$\pm$}}1
     {≈}{{$\approx$}}1 {×}{{$\times$}}1 {→}{{$\rightarrow$}}1 {✅}{{[OK]}}1
     {❌}{{[X]}}1 {⚠}{{[!]}}1 {…}{{...}}1 {✓}{{v}}1
+    {Î}{{\^I}}1 {Ï}{{\"I}}1 {Ô}{{\^O}}1 {Â}{{\^A}}1 {Û}{{\^U}}1 {Ù}{{\`U}}1
+    {Ë}{{\"E}}1 {Ü}{{\"U}}1 {Ö}{{\"O}}1 {§}{{\S}}1 {·}{{\textperiodcentered}}1
+    {°}{{\textdegree}}1 {α}{{$\alpha$}}1 {β}{{$\beta$}}1 {≠}{{$\neq$}}1
+    {≤}{{$\leq$}}1 {≥}{{$\geq$}}1 {∑}{{$\sum$}}1
 }
 
 \lstdefinestyle{py}{
@@ -159,16 +163,24 @@ cinq items notés de l'énoncé (total 20 points).
 \label{sec:solution}
 
 \subsection{Problème}
-On implémente un classifieur \textbf{Naive Bayes multinomial} pour la classification de
-texte, selon le paradigme \textbf{MapReduce}, sur Apache Spark. L'objectif pédagogique est
-de comprendre l'algorithme MapReduce du classifieur~\cite{nbmapreduce} et de le coder en
-Spark en \textbf{deux versions} (contrainte de l'énoncé), \textbf{en Python uniquement} :
+On implémente le classifieur \textbf{Naive Bayes} selon le paradigme \textbf{MapReduce}
+sur Apache Spark, en s'appuyant sur l'algorithme du papier de référence~\cite{nbmapreduce}
+(Zheng, NDSU, 2014). Le classifieur est codé en \textbf{deux versions} (contrainte de
+l'énoncé), \textbf{en Python uniquement} :
 \begin{itemize}
   \item version \textbf{RDD} (API bas niveau : \code{map} / \code{reduceByKey}) ;
   \item version \textbf{DataFrames} (API relationnelle : \code{explode} + \code{groupBy}/\code{agg}).
 \end{itemize}
 Exigence forte que nous garantissons : les deux versions produisent des \textbf{prédictions
 rigoureusement identiques} (\S\ref{sec:identite}).
+
+Nous couvrons \textbf{deux lois} partageant exactement le même cœur MapReduce (seul le calcul
+du modèle diffère, \S\ref{sec:categorical}) :
+\begin{itemize}
+  \item \textbf{multinomial} pour la classification de \emph{texte} (sac de mots) ;
+  \item \textbf{catégoriel} pour les jeux \emph{tabulaires} du papier (attribut-valeur),
+        avec discrétisation des attributs continus.
+\end{itemize}
 
 \subsection{Données}
 \begin{table}[H]
@@ -177,11 +189,14 @@ rigoureusement identiques} (\S\ref{sec:identite}).
 \toprule
 \textbf{Jeu} & \textbf{Rôle} & \textbf{Taille} & \textbf{Source} \\
 \midrule
-SMS Spam Collection & démonstration / test (petit) & 5\,574 SMS (ham/spam) & UCI \\
+SMS Spam Collection & démo texte / smoke test (petit) & 5\,574 SMS (ham/spam) & UCI \\
 20 Newsgroups & scalabilité (grand) & 18\,846 docs, 20 classes & scikit-learn \\
+mushroom, car, nursery, adult & variante catégorielle (papier) & 1\,7k--32k instances & UCI \\
 \bottomrule
 \end{tabular}
 \end{table}
+Les jeux tabulaires sont exactement ceux du papier de référence, ce qui permet une
+comparaison directe (\S\ref{sec:comparaison}). L'énoncé autorise « datasets of your choice ».
 Le petit jeu sert au notebook et au smoke test ; le grand jeu sert à l'étude de scalabilité.
 Pour 20 Newsgroups, en-têtes, pieds de page et citations sont retirés pour ne garder qu'un
 signal textuel.
@@ -263,6 +278,27 @@ l'égalité RDD/DataFrame ; le notebook obtient \textbf{accuracy $=0.9848$} sur 
 \textbf{RDD $=$ DataFrame $=$ sklearn} (prédictions identiques) ; le benchmark \code{assert}
 l'égalité des accuracy sur chacun des 16 points de mesure.
 
+\subsection{Variante catégorielle (jeux tabulaires du papier)}
+\label{sec:categorical}
+Le papier applique en réalité Naive Bayes à des données \emph{tabulaires catégorielles}.
+Chaque instance a $M$ attributs ; on estime, pour un attribut $A_i$ de valeur $a$ :
+\begin{equation}
+  \log P(A_i = a \mid c) = \log\!\left( \frac{\mathrm{count}_{a,i,c} + \alpha}{N_c + \alpha D_i} \right),
+\end{equation}
+où $D_i$ est la taille du domaine de l'attribut $i$. La \textbf{seule différence} avec le
+multinomial est le \emph{dénominateur} ($N_c$, nombre d'instances de la classe, au lieu du
+total de tokens). Le \textbf{comptage MapReduce est identique} : on encode chaque instance
+comme un sac de features (attribut, valeur), on émet $\big((c, \text{feature}), 1\big)$ et on
+somme. Seul le calcul du modèle change : dans le code, on branche
+\code{build\_model\_categorical} via le paramètre \code{model\_builder} des fonctions
+d'entraînement --- la prédiction reste \code{predict\_indices}, donc RDD $=$ DataFrame reste
+vrai. Ce modèle reproduit \code{sklearn.naive\_bayes.CategoricalNB} (vérifié).
+
+Les attributs \textbf{continus} (jeu \emph{adult}) sont d'abord \textbf{discrétisés} : un
+premier job MAP/REDUCE calcule (min, max) par colonne (comme le \emph{PreprocessMapper} du
+papier), puis on découpe en tranches (binning). C'est la structure à \textbf{deux jobs
+MapReduce} du papier.
+
 % ==============================================================================
 \section{Commentaires des fragments de code clés \hfill\normalsize\textmd{[Item 2b --- 3 pts]}}
 \label{sec:fragments}
@@ -326,6 +362,26 @@ def predict_udf(words):                        # closure référençant bc_model
 \emph{Remarque technique} : \code{get\_spark()} appelle \code{sc.addPyFile(...)} sur nos
 modules, sans quoi les workers lèveraient \code{ModuleNotFoundError: nb\_common} lors de la
 désérialisation du modèle et de l'appel à \code{predict\_indices}.
+
+\subsection{Modèle catégoriel et discrétisation (variante du papier)}
+Même comptage, dénominateur différent ($N_c + \alpha D_i$) ; et le job de discrétisation
+(min/max) est un MAP/REDUCE à part entière.
+\begin{lstlisting}[style=py]
+# Modèle CATÉGORIEL : denom dépend de l'attribut de la feature (N_c + alpha * D_i)
+for c in range(n_classes):
+    n_c = class_doc_counts.get(c, 0)
+    for f in range(vocab_size):
+        d_i = attr_domain_sizes[feature_attr[f]]        # taille du domaine de l'attribut
+        cnt = word_class_counts.get((c, f), 0)
+        log_likelihood[c][f] = math.log((cnt + alpha) / (n_c + alpha * d_i))
+
+# Discrétisation : 1er job MAP/REDUCE calculant (min, max) par colonne continue
+def emit(row):
+    for col in continuous_cols:
+        yield (col, (float(row[col]), float(row[col])))          # MAP
+minmax = sc.parallelize(rows).flatMap(emit) \
+           .reduceByKey(lambda a, b: (min(a[0], b[0]), max(a[1], b[1]))).collect()  # REDUCE
+\end{lstlisting}
 
 % ==============================================================================
 \section{Analyse expérimentale : scalabilité \hfill\normalsize\textmd{[Item 3 --- 3 pts]}}
@@ -395,6 +451,71 @@ cœurs} : sur Apple Silicon, \code{local[8]} embarque les 4 cœurs \emph{efficie
 lents) et met le driver en contention, d'où un point plus lent et fortement bruité
 ($\pm1.5$\,s). DataFrames ne profite quasiment pas des cœurs supplémentaires.
 
+\subsection{Évaluation détaillée : validation croisée et métriques}
+\label{sec:cv}
+Au-delà de l'accuracy sur un seul découpage, on suit la méthodologie du papier (§2.3.3--2.3.4) :
+\textbf{validation croisée k-fold} et métriques \textbf{précision / rappel / F1} + matrice de
+confusion. Sur SMS Spam (multinomial), en 5-fold : \textbf{accuracy $= 0.9865 \pm 0.0029$}.
+La matrice de confusion et les métriques par classe (obtenues dans le notebook) :
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Classe} & \textbf{Précision} & \textbf{Rappel} & \textbf{F1} \\
+\midrule
+ham  & 0.986 & 0.997 & 0.991 \\
+spam & 0.978 & 0.906 & 0.941 \\
+\midrule
+\textbf{macro} & 0.982 & 0.951 & \textbf{0.966} \\
+\bottomrule
+\end{tabular}
+\caption{Métriques par classe sur SMS Spam (holdout 80/20). Le rappel plus faible du
+\emph{spam} (0.906) révèle ce que l'accuracy globale (0.985) masque.}
+\end{table}
+
+\subsection{Variante catégorielle sur les jeux UCI du papier}
+\label{sec:uci}
+On applique le \textbf{Naive Bayes catégoriel} (avec discrétisation pour \emph{adult}) sur les
+quatre jeux tabulaires du papier, en \textbf{6-fold CV}. À chaque pli, RDD $=$ DataFrames
+(vérifié par \code{assert}).
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Jeu} & \textbf{Instances} & \textbf{Classes} & \textbf{Accuracy} & \textbf{Macro-F1} \\
+\midrule
+mushroom & 8\,124  & 2 & $0.953 \pm 0.007$ & 0.953 \\
+car      & 1\,728  & 4 & $0.858 \pm 0.034$ & 0.648 \\
+nursery  & 12\,960 & 5 & $0.903 \pm 0.003$ & 0.568 \\
+adult    & 32\,561 & 2 & $0.817 \pm 0.004$ & 0.769 \\
+\bottomrule
+\end{tabular}
+\caption{Naive Bayes catégoriel, 6-fold CV (accuracy moyenne $\pm$ écart-type).}
+\end{table}
+L'\textbf{écart accuracy vs macro-F1} (net pour \emph{car} et \emph{nursery}) traduit le
+\textbf{déséquilibre des classes} : la matrice de confusion de \emph{nursery} montre que la
+classe \emph{recommend} (2 instances sur 12\,960) n'est jamais prédite --- exactement le
+scénario où « l'accuracy n'est pas une bonne mesure » décrit au §2.3.3 du papier, d'où
+l'intérêt d'ajouter précision/rappel/F1.
+
+\subsection{Comparaison au papier de référence}
+\label{sec:comparaison}
+\begin{itemize}
+  \item \textbf{Algorithme} : notre cœur (map $((c,\text{feature}),1)$ $\to$ reduce somme,
+        log-vraisemblance, Laplace $+1$, prior $N_c/N$) reproduit fidèlement le modèle
+        MapReduce du papier (§3.4). Nous le portons en \textbf{Spark RDD \emph{et} DataFrames /
+        Python}, là où le papier utilise \textbf{Hadoop/Java}.
+  \item \textbf{Méthodologie} : nous reprenons ses techniques --- \emph{augmentation des
+        données} par réplication (§3.3.1), \emph{validation croisée} (§3.3.2), \emph{moyenne
+        sur plusieurs exécutions} avec écart-type (§3.5). Nous ajoutons une correction que le
+        papier ne discute pas : réplication \textbf{après} le split (anti-fuite).
+  \item \textbf{Scalabilité} : le papier fait varier le nombre de \emph{nœuds} (1 à 14) sur un
+        cluster Hadoop réel ; nous faisons varier les \emph{cœurs} \code{local[k]} et le volume
+        sur une seule machine. \textbf{Même conclusion qualitative} : gain fort au début puis
+        \textbf{rendements décroissants} (lui : 1 nœud 485\,s $\to$ 4 nœuds 180\,s $\to$ 14
+        nœuds 114\,s ; nous : plateau après ${\sim}4$ cœurs).
+\end{itemize}
+
 % ==============================================================================
 \section{Points forts et points faibles des algorithmes \hfill\normalsize\textmd{[Item 4 --- 3 pts]}}
 \label{sec:forces}
@@ -408,6 +529,9 @@ lents) et met le driver en contention, d'où un point plus lent et fortement bru
   \item \textbf{Scalabilité en volume favorable} (sous-linéaire) et \textbf{avantage net de la
         version RDD}, surtout en prédiction.
   \item \textbf{Broadcast} du modèle creux : diffusion unique par worker, économe.
+  \item \textbf{Généricité} : les deux lois (multinomial, catégoriel) partagent le même cœur
+        MapReduce ; seul \code{model\_builder} change. Résultats en ligne avec le papier
+        (mushroom $0.95$, adult $0.82$).
 \end{itemize}
 
 \subsection*{Points faibles}
@@ -427,21 +551,29 @@ lents) et met le driver en contention, d'où un point plus lent et fortement bru
         (0.620 $\to$ 0.711) : \emph{ce n'est pas une fuite} (le test dupliqué n'apporte aucune
         information), mais un effet de modélisation. La valeur de référence honnête est celle à
         ${\times}1 = 0.620$.
+  \item \textbf{Hypothèses du NB} : indépendance conditionnelle des attributs (forte), et la
+        \textbf{discrétisation} (binning à largeur égale) perd de l'information sur les attributs
+        continus --- d'où l'accuracy plus modeste sur \emph{adult} (0.82). Le déséquilibre des
+        classes (\emph{nursery}, \emph{car}) pénalise le macro-F1.
 \end{itemize}
 
 % ==============================================================================
 \section{Conclusion}
-Naive Bayes multinomial a été implémenté en MapReduce sur Spark en deux versions cohérentes
-(prédictions identiques, alignées sur scikit-learn), avec une étude de scalabilité rigoureuse
-(anti-fuite, mesures répétées). Résultats : scaling en volume sous-linéaire, avantage de la
-version RDD, speed-up parallèle réel mais modéré (limité par le mode local et le matériel).
+Naive Bayes a été implémenté en MapReduce sur Spark en deux versions cohérentes (prédictions
+identiques, alignées sur scikit-learn) et deux lois (multinomial pour le texte, catégoriel
+pour les jeux tabulaires du papier), partageant le même cœur MapReduce. L'analyse
+expérimentale couvre la \textbf{scalabilité} (volume et parallélisme), la \textbf{validation
+croisée} et des \textbf{métriques} précision/rappel/F1. Résultats : scaling en volume
+sous-linéaire, avantage de la version RDD, speed-up parallèle réel mais modéré (limité par le
+mode local et le matériel), et des accuracies conformes au papier de référence.
 Pistes : exécution sur cluster, prédiction DataFrames sans UDF Python, métriques par classe,
 mise à l'échelle du lissage.
 
 % ==============================================================================
 \begin{thebibliography}{9}
-\bibitem{nbmapreduce} \emph{Naïve Bayes Classifier --- A MapReduce Approach}. Document de
-référence du cours « ML on Big Data » (D. Colazzo), Université Paris-Dauphine.
+\bibitem{nbmapreduce} S. Zheng, \emph{Naïve Bayes Classifier: A MapReduce Approach}.
+Master's paper, North Dakota State University, Fargo, octobre 2014. (Document de référence du
+cours « ML on Big Data », D. Colazzo, Université Paris-Dauphine.)
 \bibitem{sklearn} F. Pedregosa \emph{et al.}, \emph{Scikit-learn: Machine Learning in Python},
 JMLR 12, 2011. Classe \texttt{MultinomialNB}.
 \bibitem{spark} M. Zaharia \emph{et al.}, \emph{Apache Spark: A Unified Engine for Big Data

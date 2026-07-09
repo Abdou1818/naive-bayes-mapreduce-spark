@@ -459,6 +459,256 @@ def get_spark(app_name: str = "NaiveBayesMapReduce", master: str = "local[*]"):
             spark.sparkContext.addPyFile(path)
 
     return spark
+
+
+# ===========================================================================
+# 8. Métriques d'évaluation (au-delà de l'accuracy)
+# ===========================================================================
+# Le papier de référence (Zheng, 2014, §2.3.3) mesure aussi la précision, le
+# rappel et la F-mesure, à partir d'une table de contingence / matrice de
+# confusion. On les implémente ici (multiclasse, avec moyenne « macro »).
+def confusion_matrix(y_true: Sequence[int], y_pred: Sequence[int],
+                     n_classes: int) -> List[List[int]]:
+    """Matrice de confusion ``M[t][p]`` = nb d'exemples de vraie classe ``t``
+    prédits en classe ``p``. La diagonale = prédictions correctes."""
+    m = [[0] * n_classes for _ in range(n_classes)]
+    for t, p in zip(y_true, y_pred):
+        m[t][p] += 1
+    return m
+
+
+def precision_recall_f1(y_true: Sequence[int], y_pred: Sequence[int],
+                        n_classes: int) -> dict:
+    """Précision, rappel et F1 par classe, plus les moyennes « macro ».
+
+    Pour une classe c (vue en « un contre tous ») :
+        précision = tp / (tp + fp)   (part des prédits c qui sont vraiment c)
+        rappel    = tp / (tp + fn)   (part des vrais c qu'on retrouve)
+        F1        = 2·P·R / (P + R)  (moyenne harmonique)
+    où tp = M[c][c], fp = somme_colonne_c hors diagonale, fn = somme_ligne_c hors diagonale.
+    """
+    cm = confusion_matrix(y_true, y_pred, n_classes)
+    per_class = {}
+    precisions, recalls, f1s = [], [], []
+    for c in range(n_classes):
+        tp = cm[c][c]
+        fp = sum(cm[r][c] for r in range(n_classes)) - tp   # prédits c mais pas c
+        fn = sum(cm[c][k] for k in range(n_classes)) - tp   # vrais c prédits ailleurs
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        per_class[c] = {"precision": prec, "recall": rec, "f1": f1, "support": tp + fn}
+        precisions.append(prec); recalls.append(rec); f1s.append(f1)
+    n = max(n_classes, 1)
+    return {
+        "per_class": per_class,
+        "macro_precision": sum(precisions) / n,
+        "macro_recall": sum(recalls) / n,
+        "macro_f1": sum(f1s) / n,
+        "confusion_matrix": cm,
+    }
+
+
+# ===========================================================================
+# 9. Validation croisée k-fold (§2.3.4 et §3.3.2 du papier)
+# ===========================================================================
+def kfold_split(items: Sequence, labels: Sequence, k: int = 5, seed: int = 42):
+    """Générateur de découpes k-fold : cède ``(X_train, y_train, X_test, y_test)``.
+
+    Le papier fait une validation croisée à 6 plis pour réduire le biais dû à un
+    unique découpage. À chaque tour, 1 pli sert de test et les k-1 autres de train.
+    On mélange les indices de façon reproductible (seed) avant de les répartir.
+    """
+    import random
+
+    n = len(items)
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)
+    # Répartition en k plis de tailles quasi égales.
+    folds = [idx[i::k] for i in range(k)]
+    for f in range(k):
+        test_idx = set(folds[f])
+        X_tr = [items[i] for i in idx if i not in test_idx]
+        y_tr = [labels[i] for i in idx if i not in test_idx]
+        X_te = [items[i] for i in folds[f]]
+        y_te = [labels[i] for i in folds[f]]
+        yield X_tr, y_tr, X_te, y_te
+
+
+# ===========================================================================
+# 10. Naive Bayes CATÉGORIEL (attribut-valeur) — la variante du papier
+# ===========================================================================
+# Le papier applique Naive Bayes à des jeux TABULAIRES catégoriels (adult,
+# mushroom, nursery...). Chaque instance a M attributs ; on estime
+#     P(A_i = a | c) = (count_{a,i,c} + alpha) / (N_c + alpha * D_i)
+# où D_i est le nombre de valeurs distinctes de l'attribut i (domaine), et N_c le
+# nombre d'instances de la classe c. C'est la différence clé avec le multinomial :
+# le dénominateur est N_c (nb d'instances) et non le total de tokens de la classe.
+# Le comptage map/reduce est IDENTIQUE ; seul le calcul du modèle change.
+
+@dataclass
+class PreparedTabular:
+    """Données tabulaires prêtes pour l'entraînement (partagé RDD/DataFrame)."""
+
+    vocab: Dict[Tuple[int, str], int]   # (indice_attribut, valeur) -> indice de feature
+    label_to_idx: Dict[str, int]
+    idx_to_label: List[str]
+    vocab_size: int
+    train: List[Tuple[int, List[int]]]  # (classe, [indices de features, 1 par attribut])
+    test: List[Tuple[int, List[int]]]
+    feature_attr: List[int]             # indice de feature -> indice d'attribut
+    attr_domain_sizes: List[int]        # attribut -> nb de valeurs distinctes (D_i)
+
+
+def prepare_tabular(X_train: List[List[str]], y_train: List[str],
+                    X_test: List[List[str]], y_test: List[str],
+                    label_to_idx: Dict[str, int] | None = None) -> PreparedTabular:
+    """Vectorise des instances tabulaires catégorielles en indices de features.
+
+    Une « feature » est un couple (attribut, valeur) : on garde les attributs
+    distincts même si deux attributs partagent une même valeur. Le vocabulaire et
+    les domaines sont construits sur l'ENTRAÎNEMENT seulement (comme un fit).
+    Chaque instance devient une liste de M indices (un par attribut).
+
+    ``label_to_idx`` peut être fourni (mapping GLOBAL des étiquettes) : utile en
+    validation croisée pour garder des indices de classe cohérents entre plis,
+    même si une classe rare est absente du train d'un pli.
+    """
+    m = len(X_train[0])
+    attr_values = [set() for _ in range(m)]
+    for row in X_train:
+        for i, v in enumerate(row):
+            attr_values[i].add(v)
+
+    # Vocabulaire trié (déterministe) : par attribut puis par valeur.
+    vocab: Dict[Tuple[int, str], int] = {}
+    feature_attr: List[int] = []
+    for i in range(m):
+        for v in sorted(attr_values[i]):
+            vocab[(i, v)] = len(vocab)
+            feature_attr.append(i)
+    attr_domain_sizes = [len(attr_values[i]) for i in range(m)]
+
+    if label_to_idx is None:
+        label_to_idx = build_label_index(y_train)
+    idx_to_label = [lab for lab, _ in sorted(label_to_idx.items(), key=lambda kv: kv[1])]
+
+    def to_indices(row: List[str]) -> List[int]:
+        # Une valeur inconnue à l'entraînement (OOV) est ignorée pour cet attribut.
+        out = []
+        for i, v in enumerate(row):
+            idx = vocab.get((i, v))
+            if idx is not None:
+                out.append(idx)
+        return out
+
+    train = [(label_to_idx[l], to_indices(r)) for l, r in zip(y_train, X_train)]
+    test = [(label_to_idx[l], to_indices(r)) for l, r in zip(y_test, X_test)]
+    return PreparedTabular(vocab=vocab, label_to_idx=label_to_idx,
+                           idx_to_label=idx_to_label, vocab_size=len(vocab),
+                           train=train, test=test, feature_attr=feature_attr,
+                           attr_domain_sizes=attr_domain_sizes)
+
+
+def build_model_categorical(
+    *,
+    n_docs: int,
+    vocab_size: int,
+    idx_to_label: List[str],
+    class_doc_counts: Dict[int, int],
+    class_token_totals: Dict[int, int],       # ignoré (garde la même signature)
+    word_class_counts: Dict[Tuple[int, int], int],
+    alpha: float = 1.0,
+    feature_attr: List[int],
+    attr_domain_sizes: List[int],
+) -> NaiveBayesModel:
+    """Construit le modèle Naive Bayes CATÉGORIEL à partir des comptes entiers.
+
+    Même signature que ``build_model`` (pour être branché de la même façon dans
+    les versions RDD/DataFrame) plus deux métadonnées : ``feature_attr`` et
+    ``attr_domain_sizes``. Reproduit ``sklearn.naive_bayes.CategoricalNB``.
+
+    log P(A_i=a | c) = log( (count + alpha) / (N_c + alpha * D_i) )
+    """
+    n_classes = len(idx_to_label)
+
+    # Priors : log P(c) = log(N_c / N).
+    log_prior = [
+        math.log(class_doc_counts.get(c, 0) / n_docs) if class_doc_counts.get(c, 0) > 0
+        else float("-inf")
+        for c in range(n_classes)
+    ]
+
+    # On stocke DENSE (vocab tabulaire petit) : une log-proba par (classe, feature),
+    # y compris les features de compte nul (lissées). Le dénominateur dépend de
+    # l'attribut de la feature : N_c + alpha * D_{attr(feature)}.
+    log_likelihood: List[Dict[int, float]] = [dict() for _ in range(n_classes)]
+    for c in range(n_classes):
+        n_c = class_doc_counts.get(c, 0)
+        for f in range(vocab_size):
+            d_i = attr_domain_sizes[feature_attr[f]]
+            cnt = word_class_counts.get((c, f), 0)
+            log_likelihood[c][f] = math.log((cnt + alpha) / (n_c + alpha * d_i))
+
+    # Défaut pour une feature hors-vocabulaire au test (valeur jamais vue) : rare ;
+    # on suppose un compte nul avec un domaine minimal.
+    log_likelihood_default = [
+        math.log(alpha / (class_doc_counts.get(c, 0) + alpha))
+        if class_doc_counts.get(c, 0) + alpha > 0 else float("-inf")
+        for c in range(n_classes)
+    ]
+
+    return NaiveBayesModel(
+        n_classes=n_classes, n_docs=n_docs, vocab_size=vocab_size, alpha=alpha,
+        idx_to_label=list(idx_to_label), log_prior=log_prior,
+        log_likelihood=log_likelihood, log_likelihood_default=log_likelihood_default,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. Discrétisation des attributs continus (job de prétraitement du papier)
+# ---------------------------------------------------------------------------
+def spark_minmax(sc, rows: List[List[str]], continuous_cols: List[int]) -> Dict[int, Tuple[float, float]]:
+    """Calcule (min, max) de chaque colonne continue via un job MAP/REDUCE.
+
+    Reproduit le PREMIER job MapReduce du papier (PreprocessMapper/Reducer) :
+      * MAP    : pour chaque colonne continue, émettre (col, (valeur, valeur)) ;
+      * REDUCE : reduceByKey en combinant par (min, max).
+    """
+    def emit(row):
+        for c in continuous_cols:
+            v = float(row[c])
+            yield (c, (v, v))
+
+    def combine(a, b):
+        return (min(a[0], b[0]), max(a[1], b[1]))
+
+    res = sc.parallelize(rows).flatMap(emit).reduceByKey(combine).collect()
+    return {c: (lo, hi) for c, (lo, hi) in res}
+
+
+def discretize(rows: List[List[str]], continuous_cols: List[int],
+               minmax: Dict[int, Tuple[float, float]], n_bins: int = 5) -> List[List[str]]:
+    """Remplace chaque valeur continue par un identifiant de tranche (binning).
+
+    Binning à largeur égale sur [min, max] (bornes issues du train), transformant
+    l'attribut continu en attribut catégoriel (`bin0`..`bin{n-1}`) exploitable par
+    le Naive Bayes catégoriel — comme le fait le papier (§3.3.3).
+    """
+    out = []
+    for row in rows:
+        new = list(row)
+        for c in continuous_cols:
+            lo, hi = minmax[c]
+            v = float(row[c])
+            if hi <= lo:
+                k = 0
+            else:
+                k = int((v - lo) / (hi - lo) * n_bins)
+                k = min(max(k, 0), n_bins - 1)   # borne dans [0, n_bins-1]
+            new[c] = f"bin{k}"
+        out.append(new)
+    return out
 \end{lstlisting}
 \subsection{\texttt{src/nb\_rdd.py}}
 \begin{lstlisting}[style=py]
@@ -493,8 +743,8 @@ import nb_common as C
 
 
 def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
-              idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8
-              ) -> C.NaiveBayesModel:
+              idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8,
+              model_builder=C.build_model) -> C.NaiveBayesModel:
     """Entraîne le modèle Naive Bayes en RDD (map/reduceByKey).
 
     Paramètres
@@ -505,6 +755,11 @@ def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
     idx_to_label   : correspondance indice_classe -> étiquette d'origine.
     alpha          : lissage de Laplace.
     num_partitions : nombre de partitions du RDD (parallélisme des données).
+    model_builder  : fonction (comptes -> modèle). Par défaut le multinomial
+                     ``C.build_model`` ; passer ``C.build_model_categorical``
+                     (via functools.partial) pour la variante catégorielle du
+                     papier. Le comptage map/reduce ci-dessous est IDENTIQUE dans
+                     les deux cas — seule la construction du modèle diffère.
     """
     # On distribue les documents sur le cluster (ici local[k]) en `num_partitions`.
     docs = sc.parallelize(train_data, numSlices=num_partitions)
@@ -543,7 +798,7 @@ def train_rdd(sc, train_data: List[Tuple[int, List[int]]], vocab_size: int,
 
     # --- (e) Construction du modèle (comptes entiers -> log-probas) ---------
     # Calcul factorisé dans nb_common pour être identique à la version DataFrame.
-    return C.build_model(
+    return model_builder(
         n_docs=n_docs,
         vocab_size=vocab_size,
         idx_to_label=idx_to_label,
@@ -639,9 +894,14 @@ def _to_dataframe(spark, data: List[Tuple[int, List[int]]], num_partitions: int)
 
 
 def train_dataframe(spark, train_data: List[Tuple[int, List[int]]], vocab_size: int,
-                    idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8
-                    ) -> C.NaiveBayesModel:
-    """Entraîne le modèle Naive Bayes avec l'API DataFrames (groupBy/agg)."""
+                    idx_to_label: List[str], alpha: float = 1.0, num_partitions: int = 8,
+                    model_builder=C.build_model) -> C.NaiveBayesModel:
+    """Entraîne le modèle Naive Bayes avec l'API DataFrames (groupBy/agg).
+
+    ``model_builder`` permet de choisir la loi (multinomial par défaut, ou
+    ``C.build_model_categorical`` pour la variante du papier) : le comptage
+    explode/groupBy est identique, seule la construction du modèle change.
+    """
     df = _to_dataframe(spark, train_data, num_partitions)
     df.cache()  # réutilisé plusieurs fois ci-dessous -> on le met en cache
 
@@ -679,7 +939,7 @@ def train_dataframe(spark, train_data: List[Tuple[int, List[int]]], vocab_size: 
     df.unpersist()
 
     # --- (e) Construction du modèle (identique à la version RDD) ------------
-    return C.build_model(
+    return model_builder(
         n_docs=n_docs,
         vocab_size=vocab_size,
         idx_to_label=idx_to_label,
@@ -751,9 +1011,13 @@ Deux précautions méthodologiques importantes :
 
   * **Pas de fuite de données** : la réplication est faite APRÈS le découpage
     train/test, et séparément sur chaque côté. Ainsi une copie d'un document
-    d'entraînement ne peut jamais se retrouver dans le test (et inversement).
-    L'accuracy reste donc honnête et stable quel que soit le facteur de
-    réplication (elle ne doit PAS augmenter avec le volume).
+    d'entraînement ne peut jamais se retrouver dans le test (et inversement) :
+    l'accuracy est donc HONNÊTE (aucune fuite). Elle n'est toutefois pas
+    parfaitement constante d'un facteur à l'autre : répliquer l'entraînement
+    multiplie les comptes par f, ce qui DILUE le lissage de Laplace (alpha
+    devient relativement négligeable devant f*count) et modifie légèrement le
+    modèle. C'est un effet de modélisation, pas une fuite ; la valeur de
+    référence honnête est celle au facteur x1.
   * **Bruit de mesure** : avec ``--repeat N`` (N > 1), chaque point est mesuré
     N fois ; on reporte la **moyenne** et l'**écart-type** des temps. Cela lisse
     les exécutions aberrantes (variabilité système, GC de la JVM, etc.).
@@ -1020,6 +1284,193 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 \end{lstlisting}
+\subsection{\texttt{src/uci\_experiment.py}}
+\begin{lstlisting}[style=py]
+"""
+uci_experiment.py
+=================
+
+Variante **Naive Bayes catégoriel** (celle du papier de référence, Zheng 2014),
+appliquée aux jeux tabulaires UCI (mushroom, car, nursery, adult), en Spark, avec :
+
+  * **validation croisée k-fold** (comme le papier, §3.3.2) ;
+  * **discrétisation** des attributs continus via un job MAP/REDUCE (adult, §3.3.3) ;
+  * **métriques** : accuracy (moyenne ± écart-type sur les plis), plus
+    précision / rappel / F1 (macro) et matrice de confusion (§2.3.3) ;
+  * vérification que les versions **RDD et DataFrames** donnent des prédictions
+    identiques à chaque pli.
+
+Le comptage MapReduce est le MÊME que pour le texte (``nb_rdd`` / ``nb_dataframe``)
+— seule la construction du modèle change (``build_model_categorical``), branchée
+via le paramètre ``model_builder``.
+
+Usage :
+    python src/uci_experiment.py                 # tous les jeux, 6 plis
+    python src/uci_experiment.py --dataset mushroom --folds 6
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import functools
+import os
+import statistics
+from typing import List, Tuple
+
+import nb_common as C
+import nb_rdd
+import nb_dataframe
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+UCI_DIR = os.path.join(ROOT, "data", "uci")
+RESULTS_DIR = os.path.join(ROOT, "results")
+
+# Configuration de chaque jeu : séparateur, position de l'étiquette, et indices
+# (dans la liste d'attributs, étiquette exclue) des attributs CONTINUS à discrétiser.
+DATASETS = {
+    # mushroom : étiquette en 1re colonne, 22 attributs catégoriels, rien de continu.
+    "mushroom": {"label": "first", "continuous": []},
+    # car : étiquette en dernière colonne, 6 attributs catégoriels.
+    "car": {"label": "last", "continuous": []},
+    # nursery : étiquette en dernière colonne, 8 attributs catégoriels.
+    "nursery": {"label": "last", "continuous": []},
+    # adult : étiquette en dernière colonne, attributs continus à discrétiser :
+    #   age(0), fnlwgt(2), education-num(4), capital-gain(10), capital-loss(11),
+    #   hours-per-week(12).
+    "adult": {"label": "last", "continuous": [0, 2, 4, 10, 11, 12]},
+}
+
+
+def load_uci(name: str) -> Tuple[List[List[str]], List[str], List[int]]:
+    """Charge un jeu UCI en (lignes d'attributs, étiquettes, indices continus)."""
+    cfg = DATASETS[name]
+    path = os.path.join(UCI_DIR, f"{name}.data")
+    rows: List[List[str]] = []
+    labels: List[str] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            fields = [f.strip() for f in line.split(",")]
+            if cfg["label"] == "first":
+                label, attrs = fields[0], fields[1:]
+            else:
+                label, attrs = fields[-1], fields[:-1]
+            rows.append(attrs)
+            labels.append(label)
+    return rows, labels, cfg["continuous"]
+
+
+def _run_fold(sc, spark, X_tr, y_tr, X_te, y_te, continuous, n_bins, label_to_idx):
+    """Entraîne (RDD + DataFrame) sur un pli et renvoie (y_true, y_pred, acc).
+
+    Les indices de classe sont GLOBAUX (via ``label_to_idx``) pour rester cohérents
+    entre plis lors de l'agrégation des métriques.
+    """
+    # Discrétisation des attributs continus via le job MAP/REDUCE (min/max sur le
+    # TRAIN uniquement, pour ne pas fuiter d'information du test).
+    if continuous:
+        minmax = C.spark_minmax(sc, X_tr, continuous)
+        X_tr = C.discretize(X_tr, continuous, minmax, n_bins=n_bins)
+        X_te = C.discretize(X_te, continuous, minmax, n_bins=n_bins)
+
+    data = C.prepare_tabular(X_tr, y_tr, X_te, y_te, label_to_idx=label_to_idx)
+    # Le constructeur de modèle catégoriel a besoin des métadonnées d'attributs.
+    cat_builder = functools.partial(
+        C.build_model_categorical,
+        feature_attr=data.feature_attr, attr_domain_sizes=data.attr_domain_sizes,
+    )
+
+    m_rdd = nb_rdd.train_rdd(sc, data.train, data.vocab_size, data.idx_to_label,
+                             model_builder=cat_builder)
+    m_df = nb_dataframe.train_dataframe(spark, data.train, data.vocab_size,
+                                        data.idx_to_label, model_builder=cat_builder)
+    p_rdd = nb_rdd.predict_rdd(sc, m_rdd, data.test)
+    p_df = nb_dataframe.predict_dataframe(spark, m_df, data.test)
+    assert p_rdd == p_df, "RDD et DataFrame doivent prédire à l'identique"
+
+    y_true = [c for c, _ in data.test]
+    return y_true, p_rdd, C.accuracy(y_true, p_rdd)
+
+
+def run_dataset(spark, name: str, folds: int, n_bins: int) -> dict:
+    """Exécute la validation croisée k-fold sur un jeu et renvoie un dict de mesures."""
+    sc = spark.sparkContext
+    rows, labels, continuous = load_uci(name)
+    label_to_idx = C.build_label_index(labels)  # pour agréger les métriques globales
+    n_classes = len(label_to_idx)
+
+    fold_accs: List[float] = []
+    all_true: List[int] = []
+    all_pred: List[int] = []
+
+    for X_tr, y_tr, X_te, y_te in C.kfold_split(rows, labels, k=folds, seed=42):
+        y_true, y_pred, acc = _run_fold(sc, spark, X_tr, y_tr, X_te, y_te,
+                                        continuous, n_bins, label_to_idx)
+        fold_accs.append(acc)
+        # Indices de classe GLOBAUX -> agrégation directe des métriques sur tous les plis.
+        all_true.extend(y_true)
+        all_pred.extend(y_pred)
+
+    mean_acc = statistics.mean(fold_accs)
+    std_acc = statistics.pstdev(fold_accs) if len(fold_accs) > 1 else 0.0
+    prf = C.precision_recall_f1(all_true, all_pred, n_classes)
+
+    print(f"\n=== {name} ({len(rows)} instances, {n_classes} classes, "
+          f"{folds}-fold CV) ===")
+    print(f"  Accuracy       : {mean_acc:.4f} ± {std_acc:.4f}")
+    print(f"  Macro P/R/F1   : {prf['macro_precision']:.4f} / "
+          f"{prf['macro_recall']:.4f} / {prf['macro_f1']:.4f}")
+    print(f"  Matrice de confusion (lignes=vrai, colonnes=prédit) :")
+    labels_sorted = [lab for lab, _ in sorted(label_to_idx.items(), key=lambda kv: kv[1])]
+    for i, rowm in enumerate(prf["confusion_matrix"]):
+        print(f"    {labels_sorted[i]:>12s} | {rowm}")
+
+    return {
+        "dataset": name, "n_instances": len(rows), "n_classes": n_classes,
+        "folds": folds, "acc_mean": round(mean_acc, 4), "acc_std": round(std_acc, 4),
+        "macro_precision": round(prf["macro_precision"], 4),
+        "macro_recall": round(prf["macro_recall"], 4),
+        "macro_f1": round(prf["macro_f1"], 4),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Naive Bayes catégoriel sur jeux UCI")
+    parser.add_argument("--dataset", choices=list(DATASETS) + ["all"], default="all")
+    parser.add_argument("--folds", type=int, default=6, help="Nombre de plis (CV).")
+    parser.add_argument("--bins", type=int, default=5,
+                        help="Nombre de tranches pour la discrétisation des continus.")
+    args = parser.parse_args()
+
+    names = list(DATASETS) if args.dataset == "all" else [args.dataset]
+
+    spark = C.get_spark(app_name="uci-categorical-nb", master="local[*]")
+    spark.sparkContext.setLogLevel("ERROR")
+    rows_out = []
+    try:
+        for name in names:
+            rows_out.append(run_dataset(spark, name, args.folds, args.bins))
+    finally:
+        spark.stop()
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    csv_path = os.path.join(RESULTS_DIR, "uci_results.csv")
+    fields = ["dataset", "n_instances", "n_classes", "folds", "acc_mean", "acc_std",
+              "macro_precision", "macro_recall", "macro_f1"]
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows_out)
+    print(f"\nRésultats écrits dans {csv_path}")
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
 \subsection{\texttt{tests/test\_smoke.py}}
 \begin{lstlisting}[style=py]
 """
@@ -1112,14 +1563,37 @@ def run() -> None:
         print(f"Prédictions RDD    : {pred_rdd}")
         print(f"Prédictions DF     : {pred_df}")
 
-        # --- Assertions du smoke test ---------------------------------------
+        # --- Assertions du smoke test (multinomial) -------------------------
         assert acc_rdd == acc_df, (
             f"Accuracies différentes : RDD={acc_rdd} vs DF={acc_df}"
         )
         assert pred_rdd == pred_df, (
             "Les prédictions ligne à ligne diffèrent entre RDD et DataFrame."
         )
-        print("\nOK : RDD et DataFrame donnent des prédictions et une accuracy identiques.")
+        print("\nOK (multinomial) : RDD et DataFrame donnent des prédictions identiques.")
+
+        # --- Variante CATÉGORIELLE (jeu tabulaire minuscule) ----------------
+        import functools
+
+        # 6 instances, 2 attributs catégoriels, 2 classes.
+        rows = [["a", "x"], ["a", "y"], ["b", "x"],
+                ["b", "y"], ["a", "x"], ["b", "y"]]
+        labs = ["p", "p", "n", "n", "p", "n"]
+        tab = C.prepare_tabular(rows[:4], labs[:4], rows[4:], labs[4:])
+        cat_builder = functools.partial(
+            C.build_model_categorical,
+            feature_attr=tab.feature_attr, attr_domain_sizes=tab.attr_domain_sizes,
+        )
+        cm_rdd = nb_rdd.train_rdd(sc, tab.train, tab.vocab_size, tab.idx_to_label,
+                                  model_builder=cat_builder)
+        cm_df = nb_dataframe.train_dataframe(spark, tab.train, tab.vocab_size,
+                                             tab.idx_to_label, model_builder=cat_builder)
+        cpred_rdd = nb_rdd.predict_rdd(sc, cm_rdd, tab.test)
+        cpred_df = nb_dataframe.predict_dataframe(spark, cm_df, tab.test)
+        assert cpred_rdd == cpred_df, (
+            "NB catégoriel : prédictions RDD et DataFrame différentes."
+        )
+        print("OK (catégoriel)  : RDD et DataFrame donnent des prédictions identiques.")
     finally:
         spark.stop()
 
@@ -1255,6 +1729,60 @@ def main() -> None:
     for name in bunch.target_names:
         print(f"  - {name}")
     print("\nLes données sont en cache (~/scikit_learn_data) et prêtes pour le benchmark.")
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+\subsection{\texttt{data/download\_uci.py}}
+\begin{lstlisting}[style=py]
+"""
+download_uci.py
+===============
+
+Télécharge les jeux de données tabulaires catégoriels de l'UCI utilisés dans le
+papier de référence (Zheng, 2014) : **mushroom, car, nursery, adult**.
+
+Ces jeux servent à la variante **Naive Bayes catégoriel** (``src/uci_experiment.py``),
+au plus proche du papier. Les fichiers bruts sont mis en cache dans ``data/uci/``.
+
+Usage :
+    python data/download_uci.py
+"""
+
+from __future__ import annotations
+
+import os
+import urllib.request
+
+BASE = "https://archive.ics.uci.edu/ml/machine-learning-databases"
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = os.path.join(HERE, "uci")
+
+# nom -> URL du fichier brut .data
+DATASETS = {
+    "mushroom": f"{BASE}/mushroom/agaricus-lepiota.data",
+    "car": f"{BASE}/car/car.data",
+    "nursery": f"{BASE}/nursery/nursery.data",
+    "adult": f"{BASE}/adult/adult.data",
+}
+
+
+def main() -> None:
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for name, url in DATASETS.items():
+        dest = os.path.join(OUT_DIR, f"{name}.data")
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            print(f"  {name:9s} déjà présent -> {dest}")
+            continue
+        print(f"  {name:9s} téléchargement depuis {url} ...")
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            raw = resp.read()
+        with open(dest, "wb") as fh:
+            fh.write(raw)
+        n = raw.count(b"\n")
+        print(f"            OK ({n} lignes) -> {dest}")
+    print("Terminé : jeux UCI en cache dans data/uci/.")
 
 
 if __name__ == "__main__":
