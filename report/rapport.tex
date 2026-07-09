@@ -7,9 +7,12 @@
 \usepackage{lmodern}
 
 % --- Mise en page ---
-\usepackage[margin=2.4cm]{geometry}
+\usepackage[margin=2.5cm]{geometry}
 \usepackage{microtype}
 \usepackage{parskip}
+\usepackage{setspace}
+\usepackage{fancyhdr}
+\linespread{1.06}
 
 % --- Maths, tableaux, figures, code ---
 \usepackage{amsmath}
@@ -30,7 +33,9 @@
   pdfkeywords={Naive Bayes, MapReduce, Apache Spark, RDD, DataFrames, scalabilite}
 }
 
-% --- Styles de code -----------------------------------------------------------
+% --- Palette ------------------------------------------------------------------
+\definecolor{primary}{RGB}{23,54,101}   % bleu nuit (titres, filets)
+\definecolor{accent}{RGB}{176,58,46}    % rouge sobre (accents)
 \definecolor{codebg}{gray}{0.96}
 \definecolor{outbg}{rgb}{0.94,0.96,1.0}
 \definecolor{kw}{rgb}{0.0,0.2,0.7}
@@ -72,26 +77,69 @@
 \lstset{style=py}   % style par défaut
 \newcommand{\code}[1]{\lstinline[style=py]!#1!}
 
-% --- Métadonnées --------------------------------------------------------------
-\title{\textbf{ML on Big Data}\\[0.3em]
-\large Naive Bayes multinomial en MapReduce sur Spark\\
-\normalsize (K-NN \emph{or} Naive Bayes --- option Naive Bayes)}
-\author{Abdrahamane MBOUROU CAMARA \\ \small Master MIAGE SITN --- Université Paris-Dauphine \\
-\small Cours « ML on Big Data » --- Prof. D. Colazzo}
-\date{Juillet 2026}
+% --- Titres de sections colorés (sans titlesec, indisponible) -----------------
+\makeatletter
+\renewcommand\section{\@startsection{section}{1}{\z@}%
+  {-3.5ex \@plus -1ex \@minus -.2ex}{2.2ex \@plus.2ex}%
+  {\normalfont\Large\bfseries\color{primary}}}
+\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+  {-3.0ex \@plus -1ex \@minus -.2ex}{1.3ex \@plus.2ex}%
+  {\normalfont\large\bfseries\color{primary!88!black}}}
+\renewcommand\subsubsection{\@startsection{subsubsection}{3}{\z@}%
+  {-2.8ex \@plus -1ex \@minus -.2ex}{1.1ex \@plus.2ex}%
+  {\normalfont\normalsize\bfseries\color{primary!72!black}}}
+\makeatother
+
+% --- En-têtes / pieds de page -------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape Naive Bayes en MapReduce sur Spark}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+\setlength{\headheight}{14pt}
 
 \begin{document}
-\maketitle
 
-% ==============================================================================
-\noindent\textbf{Organisation du rapport et correspondance avec le barème.}
+% ============================== PAGE DE TITRE =================================
+\thispagestyle{empty}
+\vspace*{2.2cm}
+\begin{center}
+{\color{primary}\rule{\linewidth}{1.6pt}}\\[0.8cm]
+{\Huge\bfseries\color{primary} ML on Big Data\par}
+\vspace{0.5cm}
+{\LARGE Naive Bayes multinomial\\[0.2em] en MapReduce sur Spark\par}
+\vspace{0.5cm}
+{\large\itshape K-NN \emph{or} Naive Bayes --- option Naive Bayes\par}
+\vspace{0.7cm}
+{\color{primary}\rule{\linewidth}{1.6pt}}\\[1.8cm]
+{\Large\bfseries Abdrahamane MBOUROU CAMARA\par}
+\vspace{0.6cm}
+{\large Master MIAGE SITN\\[0.2em] Université Paris-Dauphine\par}
+\vspace{0.5cm}
+{\large Cours « ML on Big Data » --- Prof. D. Colazzo\par}
+\end{center}
+\vfill
+\begin{center}{\large Juillet 2026}\end{center}
+\clearpage
+
+% ============================== TABLE DES MATIÈRES ============================
+\begingroup
+\setlength{\parskip}{0.35em}
+\tableofcontents
+\endgroup
+\clearpage
+
+% ============================== GUIDE DE LECTURE =============================
+\section*{Organisation du rapport et correspondance avec le barème}
 Ce document est structuré pour répondre \emph{explicitement}, section par section, aux
 cinq items notés de l'énoncé (total 20 points).
 
 \begin{table}[H]
 \centering
 \small
-\begin{tabular}{@{}p{8.4cm}cc@{}}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}p{8.6cm}cc@{}}
 \toprule
 \textbf{Item du barème} & \textbf{Points} & \textbf{Section} \\
 \midrule
@@ -104,10 +152,7 @@ cinq items notés de l'énoncé (total 20 points).
 \bottomrule
 \end{tabular}
 \end{table}
-
-\tableofcontents
-\bigskip
-\hrule
+\vspace{0.4em}
 
 % ==============================================================================
 \section{Description de la solution adoptée \hfill\normalsize\textmd{[Item 1 --- 3 pts]}}
