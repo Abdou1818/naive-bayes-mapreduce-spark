@@ -16,9 +16,13 @@ Deux précautions méthodologiques importantes :
 
   * **Pas de fuite de données** : la réplication est faite APRÈS le découpage
     train/test, et séparément sur chaque côté. Ainsi une copie d'un document
-    d'entraînement ne peut jamais se retrouver dans le test (et inversement).
-    L'accuracy reste donc honnête et stable quel que soit le facteur de
-    réplication (elle ne doit PAS augmenter avec le volume).
+    d'entraînement ne peut jamais se retrouver dans le test (et inversement) :
+    l'accuracy est donc HONNÊTE (aucune fuite). Elle n'est toutefois pas
+    parfaitement constante d'un facteur à l'autre : répliquer l'entraînement
+    multiplie les comptes par f, ce qui DILUE le lissage de Laplace (alpha
+    devient relativement négligeable devant f*count) et modifie légèrement le
+    modèle. C'est un effet de modélisation, pas une fuite ; la valeur de
+    référence honnête est celle au facteur x1.
   * **Bruit de mesure** : avec ``--repeat N`` (N > 1), chaque point est mesuré
     N fois ; on reporte la **moyenne** et l'**écart-type** des temps. Cela lisse
     les exécutions aberrantes (variabilité système, GC de la JVM, etc.).
