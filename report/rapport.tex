@@ -77,10 +77,6 @@
 \begin{document}
 \maketitle
 
-\begin{center}\small
-Dépôt : \url{https://github.com/Abdou1818/naive-bayes-mapreduce-spark}
-\end{center}
-
 % ==============================================================================
 \noindent\textbf{Organisation du rapport et correspondance avec le barème.}
 Ce document est structuré pour répondre \emph{explicitement}, section par section, aux
@@ -211,7 +207,7 @@ seule) au lieu de le re-sérialiser à chaque tâche.
 \label{sec:identite}
 Les comptes étant entiers (reproductibles au bit près) et la prédiction déterministe (même
 fonction \code{predict\_indices}), les deux versions donnent des prédictions identiques
-\emph{par construction}. \textbf{Vérifications} : le smoke test (aussi en CI) impose
+\emph{par construction}. \textbf{Vérifications} : le smoke test impose
 l'égalité RDD/DataFrame ; le notebook obtient \textbf{accuracy $=0.9848$} sur SMS Spam avec
 \textbf{RDD $=$ DataFrame $=$ sklearn} (prédictions identiques) ; le benchmark \code{assert}
 l'égalité des accuracy sur chacun des 16 points de mesure.
