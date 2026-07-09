@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/Abdou1818/naive-bayes-mapreduce-spark/actions/workflows/ci.yml/badge.svg)
 
-Projet du cours **« ML on Big Data »** (Prof. D. Colazzo) — Master MIAGE SITN,
+Projet du cours **« ML on Big Data »** — Master MIAGE SITN,
 Université Paris-Dauphine.
 
 Implémentation de **Naive Bayes multinomial** (lissage de Laplace `alpha=1`, calculs en
